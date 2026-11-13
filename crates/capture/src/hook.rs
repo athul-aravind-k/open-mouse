@@ -1,0 +1,266 @@
+use crossbeam_channel::{Receiver, Sender};
+use proto::{MouseBtn, Packet};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread;
+use windows::Win32::Foundation::{LPARAM, LRESULT, POINT, WPARAM};
+use windows::Win32::UI::Input::KeyboardAndMouse::{VK_CONTROL, VK_ESCAPE, VK_MENU};
+use windows::Win32::UI::WindowsAndMessaging::{
+    CallNextHookEx, DispatchMessageW, GetCursorPos, GetMessageW, PostThreadMessageW,
+    SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx, KBDLLHOOKSTRUCT,
+    LLKHF_INJECTED, LLMHF_INJECTED, MSLLHOOKSTRUCT, MSG, WH_KEYBOARD_LL, WH_MOUSE_LL,
+    WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP,
+    WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_QUIT, WM_RBUTTONDOWN, WM_RBUTTONUP,
+    WM_SYSKEYDOWN,
+};
+
+#[derive(Debug, Clone)]
+pub enum CapturedEvent {
+    Packet(Packet),
+    EdgeTrigger { x: i32, y: i32 },
+    EmergencyEscape,
+}
+
+struct HookState {
+    sender: Sender<CapturedEvent>,
+    swallow: Arc<AtomicBool>,
+    last_x: i32,
+    last_y: i32,
+    ctrl_pressed: bool,
+    alt_pressed: bool,
+}
+
+static HOOK_STATE: Mutex<Option<HookState>> = Mutex::new(None);
+
+pub struct CaptureEngine {
+    swallow: Arc<AtomicBool>,
+    thread_id: u32,
+}
+
+impl CaptureEngine {
+    pub fn new() -> (Self, Receiver<CapturedEvent>) {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let swallow = Arc::new(AtomicBool::new(false));
+        let swallow_clone = swallow.clone();
+
+        let (ready_tx, ready_rx) = crossbeam_channel::bounded(1);
+
+        thread::spawn(move || {
+            let mut pt = POINT { x: 0, y: 0 };
+            unsafe {
+                let _ = GetCursorPos(&mut pt);
+            }
+
+            {
+                let mut state = HOOK_STATE.lock().unwrap();
+                *state = Some(HookState {
+                    sender: tx,
+                    swallow: swallow_clone,
+                    last_x: pt.x,
+                    last_y: pt.y,
+                    ctrl_pressed: false,
+                    alt_pressed: false,
+                });
+            }
+
+            let (mouse_hook, kbd_hook) = unsafe {
+                let m = SetWindowsHookExW(
+                    WH_MOUSE_LL,
+                    Some(mouse_proc),
+                    None,
+                    0,
+                ).expect("Failed to install WH_MOUSE_LL");
+
+                let k = SetWindowsHookExW(
+                    WH_KEYBOARD_LL,
+                    Some(kbd_proc),
+                    None,
+                    0,
+                ).expect("Failed to install WH_KEYBOARD_LL");
+
+                (m, k)
+            };
+
+            let thread_id = unsafe { windows::Win32::System::Threading::GetCurrentThreadId() };
+            ready_tx.send(thread_id).unwrap();
+
+            let mut msg = MSG::default();
+            unsafe {
+                while GetMessageW(&mut msg, None, 0, 0).as_bool() {
+                    let _ = TranslateMessage(&msg);
+                    DispatchMessageW(&msg);
+                }
+
+                let _ = UnhookWindowsHookEx(mouse_hook);
+                let _ = UnhookWindowsHookEx(kbd_hook);
+            }
+        });
+
+        let thread_id = ready_rx.recv().expect("Failed to initialize hook thread");
+
+        (Self { swallow, thread_id }, rx)
+    }
+
+    pub fn set_swallowing(&self, swallow: bool) {
+        self.swallow.store(swallow, Ordering::SeqCst);
+    }
+
+    pub fn is_swallowing(&self) -> bool {
+        self.swallow.load(Ordering::SeqCst)
+    }
+}
+
+impl Drop for CaptureEngine {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = PostThreadMessageW(self.thread_id, WM_QUIT, WPARAM(0), LPARAM(0));
+        }
+    }
+}
+
+unsafe extern "system" fn mouse_proc(n_code: i32, w_param: WPARAM, l_param: LPARAM) -> LRESULT {
+    if n_code >= 0 {
+        let hook_struct = *(l_param.0 as *const MSLLHOOKSTRUCT);
+
+        // Ignore injected events to avoid feedback loops
+        if (hook_struct.flags & LLMHF_INJECTED) != 0 {
+            return CallNextHookEx(None, n_code, w_param, l_param);
+        }
+
+        if let Ok(mut lock) = HOOK_STATE.try_lock() {
+            if let Some(state) = lock.as_mut() {
+                let swallow = state.swallow.load(Ordering::SeqCst);
+                let msg_type = w_param.0 as u32;
+
+                if msg_type == WM_MOUSEMOVE {
+                    let cur_x = hook_struct.pt.x;
+                    let cur_y = hook_struct.pt.y;
+                    let dx = cur_x - state.last_x;
+                    let dy = cur_y - state.last_y;
+                    state.last_x = cur_x;
+                    state.last_y = cur_y;
+
+                    if swallow {
+                        if dx != 0 || dy != 0 {
+                            let _ = state.sender.send(CapturedEvent::Packet(Packet::MouseMoveRel { dx, dy }));
+                        }
+                        return LRESULT(1);
+                    } else {
+                        let _ = state.sender.send(CapturedEvent::EdgeTrigger { x: cur_x, y: cur_y });
+                    }
+                } else if swallow {
+                    match msg_type {
+                        WM_LBUTTONDOWN => {
+                            let _ = state.sender.send(CapturedEvent::Packet(Packet::MouseButton {
+                                button: MouseBtn::Left,
+                                pressed: true,
+                            }));
+                            return LRESULT(1);
+                        }
+                        WM_LBUTTONUP => {
+                            let _ = state.sender.send(CapturedEvent::Packet(Packet::MouseButton {
+                                button: MouseBtn::Left,
+                                pressed: false,
+                            }));
+                            return LRESULT(1);
+                        }
+                        WM_RBUTTONDOWN => {
+                            let _ = state.sender.send(CapturedEvent::Packet(Packet::MouseButton {
+                                button: MouseBtn::Right,
+                                pressed: true,
+                            }));
+                            return LRESULT(1);
+                        }
+                        WM_RBUTTONUP => {
+                            let _ = state.sender.send(CapturedEvent::Packet(Packet::MouseButton {
+                                button: MouseBtn::Right,
+                                pressed: false,
+                            }));
+                            return LRESULT(1);
+                        }
+                        WM_MBUTTONDOWN => {
+                            let _ = state.sender.send(CapturedEvent::Packet(Packet::MouseButton {
+                                button: MouseBtn::Middle,
+                                pressed: true,
+                            }));
+                            return LRESULT(1);
+                        }
+                        WM_MBUTTONUP => {
+                            let _ = state.sender.send(CapturedEvent::Packet(Packet::MouseButton {
+                                button: MouseBtn::Middle,
+                                pressed: false,
+                            }));
+                            return LRESULT(1);
+                        }
+                        WM_MOUSEWHEEL => {
+                            let delta = ((hook_struct.mouseData >> 16) & 0xFFFF) as i16 as i32;
+                            let _ = state.sender.send(CapturedEvent::Packet(Packet::MouseScroll {
+                                delta_x: 0,
+                                delta_y: delta,
+                            }));
+                            return LRESULT(1);
+                        }
+                        WM_MOUSEHWHEEL => {
+                            let delta = ((hook_struct.mouseData >> 16) & 0xFFFF) as i16 as i32;
+                            let _ = state.sender.send(CapturedEvent::Packet(Packet::MouseScroll {
+                                delta_x: delta,
+                                delta_y: 0,
+                            }));
+                            return LRESULT(1);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+
+    CallNextHookEx(None, n_code, w_param, l_param)
+}
+
+unsafe extern "system" fn kbd_proc(n_code: i32, w_param: WPARAM, l_param: LPARAM) -> LRESULT {
+    if n_code >= 0 {
+        let hook_struct = *(l_param.0 as *const KBDLLHOOKSTRUCT);
+
+        // Ignore injected events
+        if (hook_struct.flags.0 & LLKHF_INJECTED.0) != 0 {
+            return CallNextHookEx(None, n_code, w_param, l_param);
+        }
+
+        let msg_type = w_param.0 as u32;
+        let is_down = msg_type == WM_KEYDOWN || msg_type == WM_SYSKEYDOWN;
+        let vk = hook_struct.vkCode;
+
+        if let Ok(mut lock) = HOOK_STATE.try_lock() {
+            if let Some(state) = lock.as_mut() {
+                // Track modifier states for emergency hotkey (Ctrl + Alt + Esc)
+                if vk == VK_CONTROL.0 as u32 {
+                    state.ctrl_pressed = is_down;
+                } else if vk == VK_MENU.0 as u32 {
+                    state.alt_pressed = is_down;
+                }
+
+                // Check emergency escape condition: Ctrl + Alt + Esc pressed
+                if is_down && vk == VK_ESCAPE.0 as u32 && state.ctrl_pressed && state.alt_pressed {
+                    state.swallow.store(false, Ordering::SeqCst);
+                    let _ = state.sender.send(CapturedEvent::EmergencyEscape);
+                    return CallNextHookEx(None, n_code, w_param, l_param);
+                }
+
+                let swallow = state.swallow.load(Ordering::SeqCst);
+                if swallow {
+                    let scancode = hook_struct.scanCode as u16;
+                    let extended = (hook_struct.flags.0 & 1) != 0; // LLKHF_EXTENDED = 1
+                    let _ = state.sender.send(CapturedEvent::Packet(Packet::Key {
+                        scancode,
+                        extended,
+                        pressed: is_down,
+                    }));
+                    return LRESULT(1);
+                }
+            }
+        }
+    }
+
+    CallNextHookEx(None, n_code, w_param, l_param)
+}

@@ -1,0 +1,24 @@
+[package]
+name = "open-mouse-spike"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "spike-sender"
+path = "src/sender.rs"
+
+[[bin]]
+name = "spike-receiver"
+path = "src/receiver.rs"
+
+[dependencies]
+proto = { workspace = true }
+capture = { workspace = true }
+emulate = { workspace = true }
+windows = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+crossbeam-channel = { workspace = true }
+

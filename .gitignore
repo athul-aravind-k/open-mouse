@@ -1,0 +1,71 @@
+# =============================================================================
+# OpenMouse .gitignore
+# =============================================================================
+
+# --- Rust & Cargo ---
+/target/
+target/
+**/*.rs.bk
+*.bk
+# Cargo.lock is explicitly tracked for reproducible application builds
+
+# --- Compiled Binaries & Libraries ---
+*.exe
+*.dll
+*.so
+*.dylib
+*.pdb
+*.lib
+*.exp
+*.ilk
+*.msi
+*.cab
+*.obj
+*.o
+*.a
+
+# --- Windows System Artifacts ---
+Thumbs.db
+Thumbs.db:encryptable
+ehthumbs.db
+ehthumbs_vista.db
+*.stackdump
+[Dd]esktop.ini
+$RECYCLE.BIN/
+*.lnk
+
+# --- IDEs & Editors ---
+# JetBrains (IntelliJ, CLion, RustRover)
+.idea/
+*.iml
+*.iws
+
+# Visual Studio Code & Visual Studio
+.vscode/
+*.code-workspace
+.vs/
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+
+# Vim / Emacs swap & backup files
+*~
+*.swp
+*.swo
+.#*
+\#*#
+
+# --- macOS System Artifacts ---
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# --- Logs, Caches & Temporary Files ---
+*.log
+*.tmp
+*.temp
+*.cache
+.env
+.env.*
+*.local

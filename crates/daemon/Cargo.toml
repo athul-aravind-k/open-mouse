@@ -1,0 +1,16 @@
+[package]
+name = "daemon"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+proto = { workspace = true }
+capture = { workspace = true }
+emulate = { workspace = true }
+net = { workspace = true }
+clipboard = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true }
+thiserror = { workspace = true }
+

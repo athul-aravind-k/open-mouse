@@ -1,0 +1,15 @@
+[package]
+name = "open-mouse-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+proto = { workspace = true }
+capture = { workspace = true }
+emulate = { workspace = true }
+daemon = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
