@@ -18,6 +18,9 @@ pub struct DiscoveryService {
     running: Arc<AtomicBool>,
     is_connected: Arc<AtomicBool>,
     peer_rx: Receiver<DiscoveredPeer>,
+    local_machine_id: String,
+    local_device_name: String,
+    local_tcp_port: u16,
 }
 
 impl DiscoveryService {
@@ -69,7 +72,7 @@ impl DiscoveryService {
         // 2. Listener Thread
         let running_listener = running.clone();
         let connected_listener = is_connected.clone();
-        let id_listener = local_machine_id;
+        let id_listener = local_machine_id.clone();
 
         thread::spawn(move || {
             let socket = match UdpSocket::bind(format!("0.0.0.0:{}", DISCOVERY_PORT)) {
@@ -124,6 +127,9 @@ impl DiscoveryService {
             running,
             is_connected,
             peer_rx,
+            local_machine_id,
+            local_device_name,
+            local_tcp_port,
         }
     }
 
@@ -133,6 +139,29 @@ impl DiscoveryService {
 
     pub fn set_connected(&self, connected: bool) {
         self.is_connected.store(connected, Ordering::SeqCst);
+    }
+
+    pub fn broadcast_now(&self) {
+        let socket = match UdpSocket::bind("0.0.0.0:0") {
+            Ok(s) => {
+                let _ = s.set_broadcast(true);
+                s
+            }
+            Err(e) => {
+                eprintln!("[Discovery] Failed to bind broadcast socket for immediate broadcast: {}", e);
+                return;
+            }
+        };
+
+        let target_addr = format!("255.255.255.255:{}", DISCOVERY_PORT);
+        let beacon = DiscoveryBeacon::new(
+            self.local_machine_id.clone(),
+            self.local_device_name.clone(),
+            self.local_tcp_port,
+        );
+        if let Ok(beacon_bytes) = beacon.to_bytes() {
+            let _ = socket.send_to(&beacon_bytes, &target_addr);
+        }
     }
 
     pub fn stop(&self) {
@@ -167,5 +196,17 @@ mod tests {
         assert!(a_connects != b_connects);
         assert!(a_connects); // "Laptop-A..." < "Laptop-B..."
         assert!(!b_connects);
+    }
+
+    #[test]
+    fn test_discovery_broadcast_now() {
+        let service = DiscoveryService::new(
+            "test-machine-id".to_string(),
+            "test-device".to_string(),
+            48899,
+        );
+        // Calling broadcast_now should execute without panicking
+        service.broadcast_now();
+        service.stop();
     }
 }

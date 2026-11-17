@@ -112,6 +112,21 @@ impl KvmStateMachine {
         }
     }
 
+    pub fn set_local_screen_size(&mut self, w: i32, h: i32) {
+        if w > 0 && h > 0 {
+            self.screen_w = w;
+            self.screen_h = h;
+        }
+    }
+
+    pub fn local_screen_size(&self) -> (i32, i32) {
+        (self.screen_w, self.screen_h)
+    }
+
+    pub fn remote_screen_size(&self) -> (i32, i32) {
+        (self.remote_w, self.remote_h)
+    }
+
     /// Customizes hysteresis and timing parameters.
     pub fn with_timing(
         mut self,
@@ -457,5 +472,43 @@ mod tests {
             }
         );
         assert_eq!(sm.state(), DaemonState::Local);
+    }
+
+    #[test]
+    fn test_set_local_screen_size_and_topology_update() {
+        let mut sm = KvmStateMachine::new(1920, 1080);
+        assert_eq!(sm.local_screen_size(), (1920, 1080));
+
+        // Update local screen size to 4K resolution
+        sm.set_local_screen_size(3840, 2160);
+        assert_eq!(sm.local_screen_size(), (3840, 2160));
+
+        // Invalid dimensions should be ignored
+        sm.set_local_screen_size(0, 1000);
+        assert_eq!(sm.local_screen_size(), (3840, 2160));
+        sm.set_local_screen_size(-500, -200);
+        assert_eq!(sm.local_screen_size(), (3840, 2160));
+
+        // Test that state is preserved across resize
+        sm.process_event(StateEvent::EdgeHit { x: 3839, y: 1000 });
+        assert_eq!(sm.state(), DaemonState::RemoteActive);
+
+        // Resize while remote active
+        sm.set_local_screen_size(2560, 1440);
+        assert_eq!(sm.state(), DaemonState::RemoteActive);
+        assert_eq!(sm.local_screen_size(), (2560, 1440));
+
+        // Return coordinates should adapt to new 2560x1440 screen dimensions
+        let action = sm.process_event(StateEvent::RemoteLeaveReceived {
+            x_ratio: 0.0,
+            y_ratio: 0.5,
+        });
+        assert_eq!(
+            action,
+            StateAction::ReturnToLocal {
+                return_x: 2550, // 2560 - 10
+                return_y: 540,  // default remote_h is 1080, 0.5 * 1080 = 540
+            }
+        );
     }
 }

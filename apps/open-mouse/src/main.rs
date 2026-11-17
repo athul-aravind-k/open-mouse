@@ -11,8 +11,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
 use tray::{
-    run_message_loop, TrayManager, AUTOSTART_ENABLED, CURRENT_EDGE_TEXT, CURRENT_STATUS_TEXT,
-    ID_ARRANGE_DISPLAYS, ID_AUTOSTART, ID_CONFIG_EDIT, ID_EXIT, ID_SWITCH_EDGE, ID_UNLOCK,
+    run_message_loop, TrayEvent, TrayManager, AUTOSTART_ENABLED, CURRENT_EDGE_TEXT,
+    CURRENT_STATUS_TEXT, ID_ARRANGE_DISPLAYS, ID_AUTOSTART, ID_CONFIG_EDIT, ID_EXIT,
+    ID_SETUP_FIREWALL, ID_SWITCH_EDGE, ID_UNLOCK,
 };
 use windows::Win32::UI::WindowsAndMessaging::PostQuitMessage;
 
@@ -37,41 +38,66 @@ fn main() {
     let peer_node_cb = peer_node.clone();
     let running_cb = running.clone();
 
-    let mut tray_mgr = TrayManager::new("OpenMouse - Software KVM", move |cmd_id| {
-        match cmd_id {
-            ID_EXIT => {
-                running_cb.store(false, Ordering::SeqCst);
-                peer_node_cb.stop();
-                unsafe {
-                    PostQuitMessage(0);
+    let mut tray_mgr = TrayManager::new("OpenMouse - Software KVM", move |event| {
+        match event {
+            TrayEvent::Command(cmd_id) => match cmd_id {
+                ID_EXIT => {
+                    running_cb.store(false, Ordering::SeqCst);
+                    peer_node_cb.stop();
+                    unsafe {
+                        PostQuitMessage(0);
+                    }
                 }
+                ID_ARRANGE_DISPLAYS => {
+                    layout_window::open_layout_window(peer_node_cb.clone());
+                }
+                ID_CONFIG_EDIT => {
+                    let path = get_config_path();
+                    let _ = Command::new("notepad.exe").arg(path).spawn();
+                }
+                ID_UNLOCK => {
+                    // Emergency unlock - forces unswallow & reset
+                    capture::unclip_cursor();
+                    emulate::InputInjector::new().release_all();
+                }
+                ID_SWITCH_EDGE => {
+                    let new_edge = peer_node_cb.toggle_edge();
+                    *CURRENT_EDGE_TEXT.lock().unwrap() = Some(format!("Shared Edge: {:?}", new_edge));
+                }
+                ID_AUTOSTART => {
+                    let current = autostart::is_autostart_enabled();
+                    let new_state = !current;
+                    let _ = autostart::set_autostart(new_state);
+                    let mut cfg = load_config();
+                    cfg.autostart = new_state;
+                    let _ = save_config(&cfg);
+                    *AUTOSTART_ENABLED.lock().unwrap() = new_state;
+                }
+                ID_SETUP_FIREWALL => {
+                    launch_firewall_setup();
+                }
+                _ => {}
+            },
+            TrayEvent::PowerSuspend => {
+                tracing::info!("System suspend received, notifying peer node");
+                peer_node_cb.notify_power_suspend();
             }
-            ID_ARRANGE_DISPLAYS => {
-                layout_window::open_layout_window(peer_node_cb.clone());
+            TrayEvent::PowerResume => {
+                tracing::info!("System resume received, notifying peer node");
+                peer_node_cb.notify_power_resume();
             }
-            ID_CONFIG_EDIT => {
-                let path = get_config_path();
-                let _ = Command::new("notepad.exe").arg(path).spawn();
+            TrayEvent::SessionLock => {
+                tracing::info!("Workstation session locked, releasing input");
+                peer_node_cb.notify_power_suspend();
             }
-            ID_UNLOCK => {
-                // Emergency unlock - forces unswallow & reset
-                capture::unclip_cursor();
-                emulate::InputInjector::new().release_all();
+            TrayEvent::SessionUnlock => {
+                tracing::info!("Workstation session unlocked, restoring input");
+                peer_node_cb.notify_power_resume();
             }
-            ID_SWITCH_EDGE => {
-                let new_edge = peer_node_cb.toggle_edge();
-                *CURRENT_EDGE_TEXT.lock().unwrap() = Some(format!("Shared Edge: {:?}", new_edge));
+            TrayEvent::DisplayChange { width, height } => {
+                tracing::info!("Display topology changed to {}x{}", width, height);
+                peer_node_cb.notify_display_change(width, height);
             }
-            ID_AUTOSTART => {
-                let current = autostart::is_autostart_enabled();
-                let new_state = !current;
-                let _ = autostart::set_autostart(new_state);
-                let mut cfg = load_config();
-                cfg.autostart = new_state;
-                let _ = save_config(&cfg);
-                *AUTOSTART_ENABLED.lock().unwrap() = new_state;
-            }
-            _ => {}
         }
     });
 
@@ -125,4 +151,110 @@ fn main() {
     });
 
     run_message_loop(running);
+}
+
+fn find_firewall_script() -> Option<std::path::PathBuf> {
+    let candidates = [
+        std::path::PathBuf::from("scripts").join("setup-firewall.ps1"),
+        std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|dir| dir.join("scripts").join("setup-firewall.ps1")))
+            .unwrap_or_default(),
+        std::env::current_exe()
+            .ok()
+            .and_then(|p| {
+                p.parent()
+                    .and_then(|p| p.parent())
+                    .map(|dir| dir.join("scripts").join("setup-firewall.ps1"))
+            })
+            .unwrap_or_default(),
+    ];
+
+    candidates.into_iter().find(|p| p.exists())
+}
+
+fn launch_firewall_setup() {
+    let script_path = find_firewall_script().unwrap_or_else(|| std::path::PathBuf::from("scripts/setup-firewall.ps1"));
+
+    use windows::core::w;
+    use windows::Win32::UI::Shell::ShellExecuteW;
+    use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+
+    let op = w!("runas");
+    let file = w!("powershell.exe");
+    let arg_str = format!(
+        "-NoProfile -ExecutionPolicy Bypass -File \"{}\"",
+        script_path.display()
+    );
+    let params: Vec<u16> = arg_str.encode_utf16().chain(std::iter::once(0)).collect();
+
+    unsafe {
+        let res = ShellExecuteW(
+            None,
+            op,
+            file,
+            windows::core::PCWSTR(params.as_ptr()),
+            None,
+            SW_SHOWNORMAL,
+        );
+        if res.0 as usize <= 32 {
+            tracing::warn!("Firewall setup elevation was cancelled or failed (code: {:?})", res.0);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+    use tray::{
+        ID_ARRANGE_DISPLAYS, ID_AUTOSTART, ID_CONFIG_EDIT, ID_EXIT, ID_SETUP_FIREWALL,
+        ID_STATUS_HEADER, ID_SWITCH_EDGE, ID_UNLOCK,
+    };
+
+    #[test]
+    fn test_tray_menu_ids_unique() {
+        let ids = [
+            ID_STATUS_HEADER,
+            ID_CONFIG_EDIT,
+            ID_SWITCH_EDGE,
+            ID_UNLOCK,
+            ID_AUTOSTART,
+            ID_EXIT,
+            ID_ARRANGE_DISPLAYS,
+            ID_SETUP_FIREWALL,
+        ];
+        let set: HashSet<_> = ids.iter().collect();
+        assert_eq!(set.len(), ids.len(), "Tray menu IDs must be unique");
+    }
+
+    #[test]
+    fn test_tray_event_variants() {
+        let cmd = TrayEvent::Command(2008);
+        assert_eq!(cmd, TrayEvent::Command(ID_SETUP_FIREWALL));
+
+        let suspend = TrayEvent::PowerSuspend;
+        let resume = TrayEvent::PowerResume;
+        let lock = TrayEvent::SessionLock;
+        let unlock = TrayEvent::SessionUnlock;
+        let disp = TrayEvent::DisplayChange {
+            width: 1920,
+            height: 1080,
+        };
+
+        assert_ne!(suspend, resume);
+        assert_ne!(lock, unlock);
+        match disp {
+            TrayEvent::DisplayChange { width, height } => {
+                assert_eq!(width, 1920);
+                assert_eq!(height, 1080);
+            }
+            _ => panic!("Expected DisplayChange"),
+        }
+    }
+
+    #[test]
+    fn test_find_firewall_script_search() {
+        let _ = find_firewall_script();
+    }
 }

@@ -2,6 +2,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
+use windows::Win32::System::RemoteDesktop::{
+    WTSRegisterSessionNotification, WTSUnRegisterSessionNotification, NOTIFY_FOR_THIS_SESSION,
+};
 use windows::Win32::UI::Shell::{
     Shell_NotifyIconW, NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_MODIFY,
     NOTIFYICONDATAW,
@@ -13,6 +16,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
     HICON, IDI_APPLICATION, MF_DISABLED, MF_GRAYED, MF_SEPARATOR, MF_STRING,
     MSG, TPM_BOTTOMALIGN, TPM_LEFTALIGN, TPM_RIGHTBUTTON, WINDOW_EX_STYLE,
     WM_COMMAND, WM_DESTROY, WM_LBUTTONUP, WM_RBUTTONUP, WM_USER, WNDCLASSW, WS_OVERLAPPED,
+    WM_POWERBROADCAST, PBT_APMSUSPEND, PBT_APMRESUMEAUTOMATIC, PBT_APMRESUMESUSPEND,
+    WM_WTSSESSION_CHANGE, WTS_SESSION_LOCK, WTS_SESSION_UNLOCK,
+    WM_DISPLAYCHANGE,
 };
 
 pub const WM_TRAY_ICON: u32 = WM_USER + 101;
@@ -24,22 +30,34 @@ pub const ID_UNLOCK: usize = 2004;
 pub const ID_AUTOSTART: usize = 2005;
 pub const ID_EXIT: usize = 2006;
 pub const ID_ARRANGE_DISPLAYS: usize = 2007;
+pub const ID_SETUP_FIREWALL: usize = 2008;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TrayEvent {
+    Command(usize),
+    PowerSuspend,
+    PowerResume,
+    SessionLock,
+    SessionUnlock,
+    DisplayChange { width: u32, height: u32 },
+}
 
 pub struct TrayManager {
     nid: NOTIFYICONDATAW,
 }
 
-static TRAY_MENU_CALLBACK: Mutex<Option<Box<dyn Fn(usize) + Send + Sync>>> = Mutex::new(None);
+type TrayEventCallback = Box<dyn Fn(TrayEvent) + Send + Sync>;
+static TRAY_EVENT_CALLBACK: Mutex<Option<TrayEventCallback>> = Mutex::new(None);
 pub static CURRENT_STATUS_TEXT: Mutex<Option<String>> = Mutex::new(None);
 pub static CURRENT_EDGE_TEXT: Mutex<Option<String>> = Mutex::new(None);
 pub static AUTOSTART_ENABLED: Mutex<bool> = Mutex::new(false);
 
 impl TrayManager {
-    pub fn new<F>(title: &str, on_command: F) -> Self
+    pub fn new<F>(title: &str, on_event: F) -> Self
     where
-        F: Fn(usize) + Send + Sync + 'static,
+        F: Fn(TrayEvent) + Send + Sync + 'static,
     {
-        *TRAY_MENU_CALLBACK.lock().unwrap() = Some(Box::new(on_command));
+        *TRAY_EVENT_CALLBACK.lock().unwrap() = Some(Box::new(on_event));
 
         let class_name = w!("OpenMouseTrayClass");
         let icon = unsafe { LoadIconW(None, IDI_APPLICATION).unwrap_or(HICON(std::ptr::null_mut())) };
@@ -70,6 +88,10 @@ impl TrayManager {
                 None,
             ).expect("Failed to create tray hidden window")
         };
+
+        unsafe {
+            let _ = WTSRegisterSessionNotification(hwnd, NOTIFY_FOR_THIS_SESSION);
+        }
 
         let mut nid = NOTIFYICONDATAW {
             cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
@@ -114,6 +136,7 @@ impl TrayManager {
 impl Drop for TrayManager {
     fn drop(&mut self) {
         unsafe {
+            let _ = WTSUnRegisterSessionNotification(self.nid.hWnd);
             let _ = Shell_NotifyIconW(NIM_DELETE, &self.nid);
         }
     }
@@ -129,13 +152,51 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             LRESULT(0)
         }
         WM_COMMAND => {
-            let id = wparam.0 as usize;
-            if let Some(ref cb) = *TRAY_MENU_CALLBACK.lock().unwrap() {
-                cb(id);
+            let id = wparam.0;
+            if let Some(ref cb) = *TRAY_EVENT_CALLBACK.lock().unwrap() {
+                cb(TrayEvent::Command(id));
+            }
+            LRESULT(0)
+        }
+        WM_POWERBROADCAST => {
+            let pbt = wparam.0 as u32;
+            if pbt == PBT_APMSUSPEND {
+                capture::unclip_cursor();
+                if let Some(ref cb) = *TRAY_EVENT_CALLBACK.lock().unwrap() {
+                    cb(TrayEvent::PowerSuspend);
+                }
+            } else if pbt == PBT_APMRESUMEAUTOMATIC || pbt == PBT_APMRESUMESUSPEND {
+                if let Some(ref cb) = *TRAY_EVENT_CALLBACK.lock().unwrap() {
+                    cb(TrayEvent::PowerResume);
+                }
+            }
+            LRESULT(1)
+        }
+        WM_WTSSESSION_CHANGE => {
+            let wts = wparam.0 as u32;
+            if wts == WTS_SESSION_LOCK {
+                capture::unclip_cursor();
+                if let Some(ref cb) = *TRAY_EVENT_CALLBACK.lock().unwrap() {
+                    cb(TrayEvent::SessionLock);
+                }
+            } else if wts == WTS_SESSION_UNLOCK {
+                if let Some(ref cb) = *TRAY_EVENT_CALLBACK.lock().unwrap() {
+                    cb(TrayEvent::SessionUnlock);
+                }
+            }
+            LRESULT(0)
+        }
+        WM_DISPLAYCHANGE => {
+            let (w, h) = capture::get_primary_screen_size();
+            let width = if w > 0 { w as u32 } else { (lparam.0 & 0xFFFF) as u32 };
+            let height = if h > 0 { h as u32 } else { ((lparam.0 >> 16) & 0xFFFF) as u32 };
+            if let Some(ref cb) = *TRAY_EVENT_CALLBACK.lock().unwrap() {
+                cb(TrayEvent::DisplayChange { width, height });
             }
             LRESULT(0)
         }
         WM_DESTROY => {
+            let _ = WTSUnRegisterSessionNotification(hwnd);
             PostQuitMessage(0);
             LRESULT(0)
         }
@@ -184,6 +245,9 @@ unsafe fn show_context_menu(hwnd: HWND) {
         "Start with Windows: Disabled\0".encode_utf16().collect::<Vec<_>>()
     };
     let _ = AppendMenuW(menu, MF_STRING, ID_AUTOSTART, PCWSTR(autostart_str.as_ptr()));
+
+    let fw_str = "Configure Firewall...\0".encode_utf16().collect::<Vec<_>>();
+    let _ = AppendMenuW(menu, MF_STRING, ID_SETUP_FIREWALL, PCWSTR(fw_str.as_ptr()));
 
     let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
 

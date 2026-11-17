@@ -1,223 +1,294 @@
-# OpenMouse 🖱️⚡
+# OpenMouse
 
 [![Rust](https://img.shields.io/badge/rust-1.75%2B-orange.svg)](https://www.rust-lang.org)
 [![Platform](https://img.shields.io/badge/platform-Windows%2010%20%7C%2011-blue.svg)](https://www.microsoft.com/windows)
 [![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-green.svg)](Cargo.toml)
 
-**OpenMouse** is a high-performance, low-latency software KVM (Keyboard, Video, Mouse — input and clipboard sharing) written in Rust. Specifically engineered for dual Windows laptop setups, OpenMouse allows you to seamlessly share a single mouse, keyboard, and clipboard across machines over your local Wi-Fi or wired network, featuring smooth edge transitions and drag-and-drop screen topology management.
+OpenMouse is a high-performance, ultra-low-latency software KVM (Keyboard, Video, Mouse input and clipboard sharing) written in Rust. Specifically engineered for dual Windows laptop setups, OpenMouse allows you to seamlessly share a single mouse, keyboard, and clipboard across machines over local Wi-Fi or wired networks, featuring smooth edge transitions, interactive drag-and-drop screen topology management, and comprehensive Windows OS resilience.
 
-Zero cloud dependencies, zero telemetry — pure peer-to-peer performance with native Windows Win32 API integration.
+Zero cloud dependencies, zero telemetry -- pure peer-to-peer performance with native Windows Win32 API integration, TLS 1.3 encrypted QUIC transport, and hardware-level input capture.
 
 ---
 
 ## Table of Contents
 
-- [Features](#features)
-- [Architecture & Multi-Crate Layout](#architecture--multi-crate-layout)
+- [Core Highlights](#core-highlights)
+- [Architecture and Multi-Crate Workspace](#architecture-and-multi-crate-workspace)
+- [Key Subsystems](#key-subsystems)
+  - [Native QUIC Transport and TLS 1.3](#native-quic-transport-and-tls-13)
+  - [Zero-Configuration LAN Auto-Discovery](#zero-configuration-lan-auto-discovery)
+  - [Hardware-Level Input Capture and Injection](#hardware-level-input-capture-and-injection)
+  - [Shared Clipboard (Text and Bitmaps)](#shared-clipboard-text-and-bitmaps)
+  - [Visual Screen Arrangement Manager and Identify Overlay](#visual-screen-arrangement-manager-and-identify-overlay)
+  - [Emergency Escape and Stuck-Key Prevention](#emergency-escape-and-stuck-key-prevention)
+  - [Hardening, Sleep-Wake and Workstation Lock Resilience](#hardening-sleep-wake-and-workstation-lock-resilience)
 - [Prerequisites](#prerequisites)
-- [Building with Cargo](#building-with-cargo)
-- [Running the Spikes (Phase 0 / Phase 1)](#running-the-spikes-phase-0--phase-1)
-  - [Step 1: Start Host (Sender)](#step-1-start-host-sender)
-  - [Step 2: Start Client (Receiver)](#step-2-start-client-receiver)
-  - [Edge Transitions & Boundary Behavior](#edge-transitions--boundary-behavior)
-- [Safety Escape Hotkey (Ctrl + Alt + Esc)](#safety-escape-hotkey-ctrl--alt--esc)
+- [Quickstart: Dual-Laptop Setup](#quickstart-dual-laptop-setup)
+  - [Step 1: Build Binaries](#step-1-build-binaries)
+  - [Step 2: Windows Firewall Configuration](#step-2-windows-firewall-configuration)
+  - [Step 3: Launch OpenMouse on Both Laptops](#step-3-launch-openmouse-on-both-laptops)
+  - [Step 4: Arrange Screen Topology](#step-4-arrange-screen-topology)
+- [Tray Menu Reference](#tray-menu-reference)
+- [Verification and Testing](#verification-and-testing)
 - [Project Roadmap](#project-roadmap)
 - [License](#license)
 
 ---
 
-## Features
+## Core Highlights
 
-- **Ultra-Low Latency**: Lightweight binary serialization via [`postcard`](https://crates.io/crates/postcard) over TCP with `TCP_NODELAY` enabled.
-- **Hardware-Level Input Capture**: Windows Raw Input (`WM_INPUT`) with `RIDEV_INPUTSINK` on a dedicated message-only window (`HWND_MESSAGE`) delivering high-resolution relative deltas without cursor freeze.
-- **Reliable Input Emulation**: Win32 `SendInput` synthesis supporting relative mouse movements, high-resolution mouse wheels, and scancode-based keyboard injection.
-- **Infallible Key Tracking**: `KeyTracker` maintains state of all active keys and buttons, executing an automatic `release_all()` safeguard on transition or disconnect to prevent sticky keys.
-- **Safety Escape Override**: Hardware-level emergency escape hotkey (`Ctrl + Alt + Esc`) that immediately restores local cursor control under any condition.
-- **Bi-directional Edge Handoff**: Hysteresis boundaries and cooldown timers prevent cursor jitter at screen edges.
-- **Clipboard Sync** *(Phase 3)*: Win32 clipboard monitoring (`WM_CLIPBOARDUPDATE`) with hash-based deduplication for plain text and images.
-- **Peer-to-Peer Security** *(Phase 4)*: Zero cloud servers; direct local LAN communication with end-to-end encryption.
+- Ultra-Low Latency: Microsecond input delivery leveraging native QUIC unreliable datagrams for high-frequency mouse motion and reliable streams for keystrokes.
+- Native QUIC Transport with TLS 1.3: End-to-end encryption via self-signed ECDSA certificates with SHA-256 fingerprint validation and Trust On First Use (TOFU) pinning.
+- Zero-Configuration LAN Auto-Discovery: Autonomous UDP beacon broadcast and listener on port 48898 with deterministic tie-breaking.
+- Shared Clipboard: Seamless clipboard synchronization for text (UTF-16) and bitmap images up to 10 MB with hash-based loop suppression.
+- Interactive Screen Arrangement Canvas: Visual drag-and-drop display topology manager with magnetic edge snapping and on-screen "Identify Displays" identification badges.
+- Infallible Hardware Emergency Escape: Dedicated `Ctrl + Alt + Esc` intercept in low-level hooks instantly releases cursor clamping, unswallows input, and clears held keys.
+- Windows System Integration: Embedded Per-Monitor DPI Awareness v2 manifest (`open-mouse.exe.manifest`), system startup registry autostart toggle, and sleep/wake (`WM_POWERBROADCAST`) / lock (`WM_WTSSESSION_CHANGE`) event resilience.
 
 ---
 
-## Architecture & Multi-Crate Layout
+## Architecture and Multi-Crate Workspace
 
-OpenMouse is designed as a modular Cargo workspace separating input capture, emulation, networking, and daemon logic:
+OpenMouse is structured as a modular Cargo workspace separating input capture, emulation, networking, clipboard synchronization, state management, and user interfaces:
 
 ```text
 open-mouse/
 ├── Cargo.toml                  # Workspace manifest and centralized dependencies
-├── Cargo.lock                  # Pinned dependency graph for reproducible builds
+├── Cargo.lock                  # Pinned dependency graph
 ├── .cargo/
-│   └── config.toml             # Target & linker configuration
+│   └── config.toml             # Target and linker configuration (MinGW / MSVC)
 ├── apps/
-│   ├── open-mouse-spike/       # Phase 0 & Phase 1 verification binaries
-│   │   ├── src/sender.rs       # Host test application (captures & transmits input)
-│   │   └── src/receiver.rs     # Client test application (receives & injects input)
-│   └── open-mouse-cli/         # OpenMouse CLI and service manager
-│       └── src/main.rs
-└── crates/
-    ├── proto/                  # Wire protocol, packet definitions & postcard serialization
-    ├── capture/                # Windows hooks, Raw Input sink & cursor management
-    │   ├── src/raw_input.rs    # WM_INPUT sink with RIDEV_INPUTSINK (message-only window)
-    │   ├── src/cursor.rs       # Screen metrics, ClipCursor clamping & position helpers
-    │   └── src/hook.rs         # Low-level hooks (WH_MOUSE_LL, WH_KEYBOARD_LL) & safety hotkey
-    ├── emulate/                # Windows input injection & stuck-key prevention
-    │   ├── src/injector.rs     # Win32 SendInput synthesis
-    │   └── src/key_tracker.rs  # State tracking and infallible release_all()
-    ├── daemon/                 # KVM state machine, edge hysteresis & topology coordinator
-    ├── net/                    # Network transport, framing, and connection lifecycle
-    └── clipboard/              # Win32 clipboard monitoring and synchronization
+│   ├── open-mouse/             # Primary system tray application and GUI
+│   │   ├── build.rs            # Manifest compilation via windres or rc.exe
+│   │   ├── app.rc              # Windows resource script embedding manifest
+│   │   ├── open-mouse.exe.manifest # PerMonitorV2 manifest and OS compatibility GUIDs
+│   │   └── src/
+│   │       ├── main.rs         # Application entry point, event router, firewall setup
+│   │       ├── tray.rs         # System tray window, power/session/display message pump
+│   │       ├── layout_window.rs # Visual screen arrangement drag-and-drop canvas
+│   │       ├── identify_overlay.rs # Multi-screen display identification overlay
+│   │       └── autostart.rs    # Windows Registry Run key autostart manager
+│   ├── open-mouse-cli/         # Command-line configuration tool
+│   └── open-mouse-spike/       # Protocol and pipeline validation spikes
+├── crates/
+│   ├── proto/                  # Wire protocol packets and postcard binary serialization
+│   ├── capture/                # Low-level hooks (WH_MOUSE_LL, WH_KEYBOARD_LL) and Raw Input
+│   ├── emulate/                # Win32 SendInput synthesis and KeyTracker stuck-key safeguards
+│   ├── net/                    # Quinn QUIC transport, TLS 1.3 cert generation and pinning
+│   ├── clipboard/              # Win32 clipboard listener and text/image sync engine
+│   └── daemon/                 # KVM state machine, LAN discovery service and peer coordinator
+├── scripts/
+│   └── setup-firewall.ps1      # Automated Windows Defender Firewall setup script with UAC
+└── docs/
+    └── code_review_plan.md     # Comprehensive 5-pillar security and concurrency review plan
 ```
 
-### Crate Descriptions
+### Workspace Crate Inventory
 
 | Crate | Responsibilities |
 |---|---|
-| **`proto`** | Defines `Packet` types (`Hello`, `Enter`, `Leave`, `MouseMoveRel`, `MouseButton`, `MouseScroll`, `Key`, `ClipboardOffer`, `ClipboardRequest`, `ClipboardData`, `EmergencyReset`). Uses `postcard` and length-delimited stream framing. |
-| **`capture`** | Captures mouse and keyboard input on Windows. Combines `WH_MOUSE_LL` and `WH_KEYBOARD_LL` hooks for edge crossing detection and input swallowing with `WM_INPUT` (`RIDEV_INPUTSINK`) for hardware mouse deltas while the cursor is clamped with `ClipCursor`. |
-| **`emulate`** | Uses Win32 `SendInput` to inject relative mouse movement, buttons, wheels, and keystrokes using hardware scancodes. Includes `KeyTracker` to prevent stuck keys. |
-| **`daemon`** | Coordinates KVM states (`Local`, `RemoteActive`, `RemoteControlled`, `Disconnected`), screen layout boundaries, transition cooldowns, and hysteresis margins. |
-| **`net`** | Manages TCP/socket transport, framing, heartbeat health checks, and automatic reconnection. |
-| **`clipboard`** | Monitors the Windows clipboard via `AddClipboardFormatListener`, computes format hashes to prevent echo loops, and synchronizes text and bitmap data. |
-| **`open-mouse-spike`** | Standalone executable binaries (`spike-sender` and `spike-receiver`) for rapid validation of capture, transport, and injection pipelines. |
-| **`open-mouse-cli`** | Command-line management tool for configuring screen layouts, managing the daemon, and viewing real-time connection status. |
+| `proto` | Defines wire `Packet` structures (`Hello`, `Enter`, `Leave`, `MouseMoveRel`, `MouseButton`, `MouseScroll`, `Key`, `ClipboardOffer`, `ClipboardRequest`, `ClipboardData`, `EmergencyReset`, `Identify`, `ArrangementUpdate`, `Heartbeat`). Uses compact `postcard` binary serialization. |
+| `capture` | Captures local mouse and keyboard input. Integrates low-level hooks (`WH_MOUSE_LL`, `WH_KEYBOARD_LL`) for boundary edge detection and input swallowing with Windows Raw Input (`WM_INPUT` with `RIDEV_INPUTSINK`) for hardware mouse mickeys. Exposes `rehook()` for sleep/wake recovery. |
+| `emulate` | Injects synthetic mouse movements, mouse clicks, mouse wheel scrolls, and keystrokes using Win32 `SendInput`. Tracks depressed keys in `KeyTracker` with an infallible `release_all()` safeguard. |
+| `net` | Manages native QUIC transport over UDP port 48899 via `quinn` and `rustls`. Implements self-signed certificate generation, fingerprint verification, and multiplexing across unreliable datagrams and reliable streams. |
+| `clipboard` | Intercepts Windows clipboard changes via `AddClipboardFormatListener` and `WM_CLIPBOARDUPDATE`. Computes SHA-256 hashes to suppress circular echo loops. Serializes and deserializes UTF-16 text and DIB/BMP images up to 10 MB. |
+| `daemon` | Houses `KvmStateMachine` for coordinate tracking, edge crossing detection, return coordinate calculation, and hysteresis cooldown. Runs `DiscoveryService` for LAN UDP broadcast beacons on port 48898 and coordinates peer lifecycle in `PeerNode`. |
+| `open-mouse` | Main Windows tray application. Provides hidden broadcast message handling (`WM_POWERBROADCAST`, `WM_WTSSESSION_CHANGE`, `WM_DISPLAYCHANGE`), visual monitor arrangement canvas, display identification overlays, and firewall launch. |
+
+---
+
+## Key Subsystems
+
+### Native QUIC Transport and TLS 1.3
+
+OpenMouse utilizes native QUIC (over UDP port 48899) implemented via `quinn` and `rustls`:
+- Multiplexing: High-frequency mouse delta packets are transmitted over unreliable QUIC datagrams, guaranteeing zero head-of-line blocking and minimal latency. Key events, clipboard streams, and arrangement updates travel over reliable, ordered QUIC streams.
+- Security: All traffic is encrypted using TLS 1.3. Each node generates an ephemeral ECDSA P-256 certificate on first boot and computes its SHA-256 fingerprint. Peer certificates are pinned using a Trust On First Use (TOFU) policy stored in `config.json`.
+- Health Monitoring: The transport runs continuous round-trip time (RTT) tracking and heartbeat checks, automatically initiating key release and fallback to searching if connection loss occurs.
+
+### Zero-Configuration LAN Auto-Discovery
+
+`DiscoveryService` operates on UDP port 48898:
+- Autonomous Beacons: Nodes broadcast periodic discovery beacons containing machine identifier, device name, and listening port.
+- Deterministic Tie-Breaking: When two peers detect each other simultaneously, a deterministic lexicographical tie-breaker (`local_id < remote_id`) designates one machine as connector and the other as listener, preventing dual-connection contention.
+- Instant Wake Broadcast: Upon system resume from sleep, `broadcast_now()` sends immediate beacons without waiting for the default timer interval.
+
+### Hardware-Level Input Capture and Injection
+
+Input handling is engineered for sub-millisecond responsiveness without cursor drift:
+- Windows Raw Input: A message-only window (`HWND_MESSAGE`) registers for mouse input via `RegisterRawInputDevices` with `RIDEV_INPUTSINK`. Relative mickeys (`lLastX`, `lLastY`) are read directly from hardware packets, avoiding Windows mouse acceleration distortion.
+- Cursor Clamping: When control transitions to the remote peer, the cursor is parked at the boundary and clamped using Win32 `ClipCursor` to prevent accidental clicks on background local applications.
+- Low-Level Hooks: `WH_MOUSE_LL` and `WH_KEYBOARD_LL` hooks intercept edge triggers and swallow local keystrokes when remote control is active, routing input exclusively to the remote peer.
+
+### Shared Clipboard (Text and Bitmaps)
+
+OpenMouse synchronizes clipboard content transparently between connected machines:
+- Format Support: Supports standard UTF-16 Unicode plain text (`CF_UNICODETEXT`) and bitmap images (`CF_DIBV5` / `CF_DIB`) up to 10 MB.
+- Loop Suppression: The clipboard engine computes a cryptographic hash of clipboard contents. When remote clipboard data is injected locally, its hash is recorded in a suppression cache to prevent ping-pong reflection back across the network.
+- Stream Transfer: Large clipboard payloads are transmitted asynchronously over dedicated QUIC streams without delaying high-priority mouse and keyboard packets.
+
+### Visual Screen Arrangement Manager and Identify Overlay
+
+Clicking "Arrange Displays..." from the tray opens the Screen Arrangement Manager:
+- Drag-and-Drop Canvas: Displays a visual representation of both laptops. Drag the remote screen around the local screen to align them matching your physical desk configuration.
+- Magnetic Edge Snapping: Screens automatically snap to Right, Left, Top, or Bottom boundaries when moved within threshold proximity.
+- Identify Displays: Clicking "Identify Displays" flashes full-screen semi-transparent overlay badges ("1" on local, "2" on remote) for 2.5 seconds, ensuring accurate physical-to-virtual mapping.
+
+### Emergency Escape and Stuck-Key Prevention
+
+Safety mechanisms prevent trapped cursors or sticky modifier keys:
+- Emergency Hotkey (`Ctrl + Alt + Esc`): Handled directly inside `kbd_proc` before any swallowing logic. Instantly releases `ClipCursor`, halts input swallowing, recenters the cursor on the primary screen, and notifies the peer.
+- Stuck-Key Safeguard: `KeyTracker` records all keydown and buttondown events. On any state transition, emergency escape, network disconnect, or workstation lock, `injector.release_all()` synthesizes matching `KEYUP` and `UP` events for all currently depressed inputs.
+
+### Hardening, Sleep-Wake and Workstation Lock Resilience
+
+OpenMouse is hardened against Windows power state and session transitions:
+- Sleep / Wake (`WM_POWERBROADCAST`):
+  - On `PBT_APMSUSPEND`: Unclips cursor, releases all keys via `injector.release_all()`, returns state machine to `Local`, and notifies the remote peer.
+  - On `PBT_APMRESUMEAUTOMATIC` / `PBT_APMRESUMESUSPEND`: Calls `CaptureEngine::rehook()` (`WM_USER + 201`) to reinstall clean low-level hooks, unclips cursor, and triggers immediate UDP discovery broadcast via `broadcast_now()`.
+- Workstation Lock (`WM_WTSSESSION_CHANGE`):
+  - On `WTS_SESSION_LOCK`: Unclips the cursor and releases all keys so local credentials can be entered on the secure lock desktop without interference.
+  - On `WTS_SESSION_UNLOCK`: Re-arms capture hooks and restores operational state.
+- Screen Topology Updates (`WM_DISPLAYCHANGE`):
+  - Dynamically extracts updated monitor dimensions, updates `KvmStateMachine::set_local_screen_size`, and transmits an updated `Packet::Hello` with updated `ScreenDescriptor` to the connected peer.
 
 ---
 
 ## Prerequisites
 
-- **Operating System**: Windows 10 or Windows 11 (64-bit).
-- **Rust Toolchain**: Rust 1.75+ (stable). Install via [rustup.rs](https://rustup.rs/).
-- **C Compiler / Linker**:
-  - **MSVC (Recommended)**: Visual Studio 2022 or Build Tools with "Desktop development with C++".
-  - **MinGW-w64 (GNU)**: GCC toolchain (e.g., via WinLibs or MSYS2) configured for `x86_64-pc-windows-gnu`.
-- **Local Network**: Both laptops must be connected to the same local network (Wi-Fi or Ethernet), with TCP port `48899` accessible between the machines.
+- Operating System: Windows 10 or Windows 11 (64-bit).
+- Rust Toolchain: Rust 1.75+ (stable). Install via [rustup.rs](https://rustup.rs/).
+- C Compiler / Linker:
+  - MSVC (Recommended): Visual Studio 2022 or Build Tools with "Desktop development with C++".
+  - MinGW-w64 (GNU): GCC toolchain (e.g. WinLibs or MSYS2) configured for `x86_64-pc-windows-gnu`.
+- Local Network: Both laptops connected to the same Wi-Fi network or Ethernet subnet.
 
 ---
 
-## Building with Cargo
+## Quickstart: Dual-Laptop Setup
 
-Check the workspace for syntax and type correctness:
+Follow these steps to connect two Windows laptops:
+
+### Step 1: Build Binaries
+
+Clone the repository and build the release executable on both machines:
+
 ```powershell
-cargo check --workspace
+git clone https://github.com/athul/open-mouse.git
+cd open-mouse
+cargo build --release --bin open-mouse
 ```
 
-Build all workspace crates and binaries in debug mode:
+The compiled executable is located at `target\release\open-mouse.exe`.
+
+### Step 2: Windows Firewall Configuration
+
+OpenMouse requires inbound UDP access on ports 48898 (discovery) and 48899 (QUIC). You can configure the Windows Firewall using either method:
+
+Method A: Run the Automated PowerShell Script
 ```powershell
-cargo build --workspace
+powershell -ExecutionPolicy Bypass -File scripts\setup-firewall.ps1
+```
+The script automatically requests administrator elevation (UAC) and registers inbound rules across Domain, Private, and Public profiles.
+
+Method B: Tray Menu Option
+Launch `open-mouse.exe`, right-click the system tray icon, and click **Configure Firewall...**. Accept the Windows UAC elevation prompt.
+
+### Step 3: Launch OpenMouse on Both Laptops
+
+Run `open-mouse.exe` on Laptop A and Laptop B:
+
+```powershell
+.\target\release\open-mouse.exe
 ```
 
-Build optimized release binaries (recommended for lowest input latency):
-```powershell
-cargo build --workspace --release
-```
+1. OpenMouse creates a tray icon and begins broadcasting LAN discovery beacons on UDP 48898.
+2. Within seconds, the laptops discover each other and establish an encrypted QUIC session on UDP 48899.
+3. The tray icon status updates from "Searching for peers on LAN" to "Status: Connected to <PeerName> (<RTT> ms)".
 
-Run unit tests across all crates:
+### Step 4: Arrange Screen Topology
+
+1. Right-click the OpenMouse tray icon and select **Arrange Displays...**.
+2. Click **Identify Displays** to verify which machine is display 1 and display 2.
+3. Drag the remote display box to match your desk layout (e.g. place it to the right of your primary screen).
+4. Click **Apply Layout**.
+5. Move your mouse across the boundary edge -- your cursor seamlessly transitions to the second laptop!
+
+---
+
+## Tray Menu Reference
+
+Right-clicking the OpenMouse system tray icon displays the following context menu:
+
+- Status Header: Displays current connection state, peer name, and round-trip latency (read-only).
+- Arrange Displays...: Opens the interactive visual monitor arrangement canvas.
+- Edit Config (Peer IP & Settings): Opens `config.json` in Notepad for manual configuration.
+- Switch Shared Edge: Toggles the transition boundary between Right, Left, Top, and Bottom edges.
+- Emergency Unlock (Ctrl+Alt+Esc): Immediately releases cursor clipping, clears held keys, and restores local control.
+- Start with Windows: Toggles automatic launch at Windows login via the CurrentUser Run registry key.
+- Configure Firewall...: Executes `scripts/setup-firewall.ps1` with UAC elevation.
+- Exit OpenMouse: Safely unhooks capture pipelines, restores cursor mobility, and terminates the application.
+
+---
+
+## Verification and Testing
+
+Execute the complete test suite across the workspace:
+
 ```powershell
+# Run all unit and integration tests across all workspace crates
 cargo test --workspace
-```
 
-Check code style and linting:
-```powershell
+# Compile optimized release binary
+cargo build --release --bin open-mouse
+
+# Validate code formatting and clippy lints
 cargo clippy --workspace
 ```
 
----
-
-## Running the Spikes (Phase 0 / Phase 1)
-
-The workspace includes interactive spike applications to verify end-to-end input capture, network transfer, and synthetic injection between two Windows laptops.
-
-### Step 1: Start Host (Sender)
-
-On the **Host laptop** (the laptop with the physical mouse and keyboard):
+To verify the embedded Per-Monitor DPI Awareness v2 application manifest in the compiled binary:
 
 ```powershell
-# Listen on default address (0.0.0.0:48899)
-cargo run -p open-mouse-spike --bin spike-sender
-
-# Or listen on a specific IP address / port:
-cargo run -p open-mouse-spike --bin spike-sender -- 0.0.0.0:48899
+powershell -Command "$bytes = [System.IO.File]::ReadAllBytes('target\release\open-mouse.exe'); $text = [System.Text.Encoding]::UTF8.GetString($bytes); Write-Host 'PerMonitorV2 Present:' $text.Contains('PerMonitorV2'); Write-Host 'Win10/11 GUID Present:' $text.Contains('8e0f7a12-bfb3-4fe8-b9a5-48fd50a15a9a')"
 ```
-
-When started, the sender will print its detected primary screen resolution and wait for an incoming connection from the client.
-
-### Step 2: Start Client (Receiver)
-
-On the **Client laptop** (the laptop you want to control):
-
-```powershell
-# Connect to host laptop via local LAN IP
-cargo run -p open-mouse-spike --bin spike-receiver -- <HOST_IP>:48899
-
-# Example:
-cargo run -p open-mouse-spike --bin spike-receiver -- 192.168.1.50:48899
-```
-
-*(Note: For single-machine loopback testing, you can omit the IP or specify `127.0.0.1:48899`).*
-
-### Edge Transitions & Boundary Behavior
-
-1. **Host to Remote**:
-   - Push your cursor on the Host laptop to the **far right edge** of the primary screen (`x >= screen_width - 2`).
-   - The Host sender detects the edge crossing, parks the cursor at the boundary using `ClipCursor`, activates local input swallowing, and transmits `Packet::Enter` with the scaled `y_ratio`.
-   - The Client receiver receives `Packet::Enter`, positions its cursor at the corresponding entry point on its screen, and begins injecting mouse movements, clicks, scrolls, and keystrokes.
-2. **Remote to Host Return**:
-   - Push the cursor on the Client laptop past the **left edge** back towards the Host.
-   - The Client transmits `Packet::Leave`, calls `injector.release_all()`, and surrenders control.
-   - The Host unclips the cursor (`unclip_cursor()`), deactivates input swallowing, restores local cursor mobility, and activates an entry cooldown to prevent bounceback.
-
----
-
-## Safety Escape Hotkey (Ctrl + Alt + Esc)
-
-When developing or running software KVM tools, input capture issues or network interruptions could theoretically trap cursor or keyboard control. OpenMouse includes an infallible, hardware-level emergency escape hotkey:
-
-$$\mathbf{Ctrl} + \mathbf{Alt} + \mathbf{Esc}$$
-
-### How It Works:
-- **Low-Level Intercept**: Handled inside the Windows low-level keyboard hook procedure (`WH_KEYBOARD_LL`) before any input swallowing or network dispatch occurs.
-- **Host Immediate Recovery**:
-  1. Instantly clears input swallowing (`set_swallowing(false)`).
-  2. Unclips the cursor via `ClipCursor(None)` to restore complete local mouse movement.
-  3. Re-centers the cursor to the middle of the screen (`screen_width / 2`, `screen_height / 2`) to prevent accidental immediate re-triggering at the screen edge.
-  4. Sends `Packet::EmergencyReset` to the connected client.
-- **Client Immediate Recovery**:
-  1. Upon receiving `Packet::EmergencyReset` (or upon TCP connection loss), the client immediately executes `injector.release_all()`.
-  2. All currently depressed mouse buttons and keys are synthesized as `KEYUP` and `UP` events, preventing stuck modifiers (such as stuck Shift, Ctrl, or Alt).
-
-You can press `Ctrl + Alt + Esc` at any moment to instantly reclaim 100% local control.
 
 ---
 
 ## Project Roadmap
 
-- [x] **Phase 0: Spikes & Foundation**
+- [x] Phase 0: Spikes and Foundation
   - [x] Cargo workspace setup and architecture definition.
   - [x] Wire protocol (`crates/proto`) with `postcard` serialization and length-delimited framing.
-  - [x] Win32 input synthesis (`crates/emulate`) and `KeyTracker` with stuck-key prevention.
+  - [x] Win32 input synthesis (`crates/emulate`) and `KeyTracker` stuck-key safeguards.
   - [x] Low-level hook capture (`WH_MOUSE_LL` / `WH_KEYBOARD_LL`) with edge detection and input swallowing.
   - [x] Hardware emergency escape hotkey (`Ctrl + Alt + Esc`).
-  - [x] Standard `.gitignore`, developer documentation, and initial repository commit.
-- [ ] **Phase 1: Core KVM & Raw Input**
-  - [ ] Windows Raw Input sink (`WM_INPUT`) with `RIDEV_INPUTSINK` and message-only window (`HWND_MESSAGE`).
-  - [ ] Cursor parking with hardware relative mickeys (`lLastX`, `lLastY`).
-  - [ ] Full bi-directional `Enter` and `Leave` handoff between sender and receiver.
-  - [ ] Hysteresis margins and transition cooldown timers.
-- [ ] **Phase 2: Topology, Edge Detection & Daemon**
-  - [ ] Daemon state machine (`Local`, `RemoteActive`, `RemoteControlled`, `Disconnected`).
-  - [ ] Configurable screen arrangements (Left/Right, Top/Bottom, custom offsets).
-  - [ ] Multi-monitor support and per-monitor DPI scale compensation.
-  - [ ] TCP keepalive, heartbeat pings, and automatic background reconnection.
-- [ ] **Phase 3: Clipboard Synchronization**
-  - [ ] Win32 clipboard listener (`WM_CLIPBOARDUPDATE`).
-  - [ ] SHA-256 hash checking to prevent echo feedback loops.
-  - [ ] Text (`CF_UNICODETEXT`) and Bitmap image clipboard synchronization over framed streams.
-- [ ] **Phase 4: Encryption, Peer Discovery & Modern GUI**
-  - [ ] End-to-end transport encryption (TLS 1.3 or Noise Protocol).
-  - [ ] Zero-configuration local network discovery via mDNS / SSDP.
-  - [ ] Modern native Windows GUI (Slint or Tauri) with interactive drag-and-drop screen layout canvas.
-  - [ ] System tray integration with quick disconnect and settings toggles.
+- [x] Phase 1: Core KVM and Raw Input
+  - [x] Windows Raw Input sink (`WM_INPUT`) with `RIDEV_INPUTSINK` on message-only window (`HWND_MESSAGE`).
+  - [x] Cursor parking with hardware relative mickeys (`lLastX`, `lLastY`).
+  - [x] Full bi-directional `Enter` and `Leave` handoff between sender and receiver.
+  - [x] Hysteresis margins and transition cooldown timers.
+- [x] Phase 2: Topology, Edge Detection and Daemon
+  - [x] Daemon state machine (`Local`, `RemoteActive`, `RemoteControlled`, `Disconnected`).
+  - [x] Configurable screen arrangements (Left, Right, Top, Bottom, and continuous offsets).
+  - [x] Interactive screen arrangement window (`layout_window.rs`) with magnetic edge snapping.
+  - [x] Multi-display "Identify Displays" on-screen overlay (`identify_overlay.rs`).
+- [x] Phase 3: Clipboard Synchronization
+  - [x] Win32 clipboard monitoring via `AddClipboardFormatListener` and `WM_CLIPBOARDUPDATE`.
+  - [x] SHA-256 hash checking to prevent echo feedback loops.
+  - [x] Text (`CF_UNICODETEXT`) and Bitmap image (`CF_DIBV5`) clipboard synchronization over framed streams up to 10 MB.
+- [x] Phase 4: Encryption, Peer Discovery and Modern GUI
+  - [x] Native QUIC transport (`crates/net`) with TLS 1.3 encryption and TOFU certificate fingerprint pinning.
+  - [x] Zero-configuration local network discovery (`crates/daemon/src/discovery.rs`) on UDP port 48898.
+  - [x] Native Windows system tray application (`apps/open-mouse`) with interactive context menus.
+  - [x] Windows startup autostart integration via registry `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`.
+- [x] Phase 5: Hardening, Resilience and Windows Integration
+  - [x] Sleep / wake resilience (`WM_POWERBROADCAST`: `PBT_APMSUSPEND` and `PBT_APMRESUME...`).
+  - [x] Workstation lock resilience (`WM_WTSSESSION_CHANGE` via `WTSRegisterSessionNotification`).
+  - [x] Screen resolution dynamic adaptation (`WM_DISPLAYCHANGE`).
+  - [x] Dynamic hook lifecycle re-hooking (`CaptureEngine::rehook` via `WM_USER + 201`).
+  - [x] Native Windows manifest declaring `PerMonitorV2` DPI awareness and Windows 10/11 compatibility GUIDs.
+  - [x] Automated Windows Defender Firewall script (`scripts/setup-firewall.ps1`) and tray menu option.
+  - [x] Strict zero-emoji repository compliance and comprehensive code review plan.
 
 ---
 

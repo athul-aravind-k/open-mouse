@@ -6,13 +6,15 @@ use std::thread;
 use windows::Win32::Foundation::{LPARAM, LRESULT, POINT, WPARAM};
 use windows::Win32::UI::Input::KeyboardAndMouse::{VK_CONTROL, VK_ESCAPE, VK_MENU};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CallNextHookEx, DispatchMessageW, GetCursorPos, GetMessageW, PostThreadMessageW,
+    CallNextHookEx, DispatchMessageW, GetCursorPos, GetMessageW, PeekMessageW, PostThreadMessageW,
     SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx, KBDLLHOOKSTRUCT,
-    LLKHF_INJECTED, LLMHF_INJECTED, MSLLHOOKSTRUCT, MSG, WH_KEYBOARD_LL, WH_MOUSE_LL,
+    LLKHF_INJECTED, LLMHF_INJECTED, MSLLHOOKSTRUCT, MSG, PM_NOREMOVE, WH_KEYBOARD_LL, WH_MOUSE_LL,
     WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP,
     WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_QUIT, WM_RBUTTONDOWN, WM_RBUTTONUP,
-    WM_SYSKEYDOWN,
+    WM_SYSKEYDOWN, WM_USER,
 };
+
+pub const WM_REHOOK: u32 = WM_USER + 201;
 
 #[derive(Debug, Clone)]
 pub enum CapturedEvent {
@@ -70,22 +72,17 @@ impl CaptureEngine {
                 });
             }
 
-            let (mouse_hook, kbd_hook) = unsafe {
-                let m = SetWindowsHookExW(
-                    WH_MOUSE_LL,
-                    Some(mouse_proc),
-                    None,
-                    0,
-                ).expect("Failed to install WH_MOUSE_LL");
+            // Force creation of thread message queue before publishing thread_id
+            let mut init_msg = MSG::default();
+            unsafe {
+                let _ = PeekMessageW(&mut init_msg, None, 0, 0, PM_NOREMOVE);
+            }
 
-                let k = SetWindowsHookExW(
-                    WH_KEYBOARD_LL,
-                    Some(kbd_proc),
-                    None,
-                    0,
-                ).expect("Failed to install WH_KEYBOARD_LL");
-
-                (m, k)
+            let mut mouse_hook = unsafe {
+                SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_proc), None, 0).ok()
+            };
+            let mut kbd_hook = unsafe {
+                SetWindowsHookExW(WH_KEYBOARD_LL, Some(kbd_proc), None, 0).ok()
             };
 
             let thread_id = unsafe { windows::Win32::System::Threading::GetCurrentThreadId() };
@@ -94,18 +91,53 @@ impl CaptureEngine {
             let mut msg = MSG::default();
             unsafe {
                 while GetMessageW(&mut msg, None, 0, 0).as_bool() {
+                    if msg.message == WM_REHOOK {
+                        if let Some(h) = mouse_hook.take() {
+                            let _ = UnhookWindowsHookEx(h);
+                        }
+                        if let Some(h) = kbd_hook.take() {
+                            let _ = UnhookWindowsHookEx(h);
+                        }
+
+                        if let Ok(mut state_guard) = HOOK_STATE.lock() {
+                            if let Some(state) = state_guard.as_mut() {
+                                state.ctrl_pressed = false;
+                                state.alt_pressed = false;
+                                let mut cur_pt = POINT { x: 0, y: 0 };
+                                if GetCursorPos(&mut cur_pt).is_ok() {
+                                    state.last_x = cur_pt.x;
+                                    state.last_y = cur_pt.y;
+                                }
+                            }
+                        }
+
+                        mouse_hook = SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_proc), None, 0).ok();
+                        kbd_hook = SetWindowsHookExW(WH_KEYBOARD_LL, Some(kbd_proc), None, 0).ok();
+                        continue;
+                    }
+
                     let _ = TranslateMessage(&msg);
                     DispatchMessageW(&msg);
                 }
 
-                let _ = UnhookWindowsHookEx(mouse_hook);
-                let _ = UnhookWindowsHookEx(kbd_hook);
+                if let Some(h) = mouse_hook {
+                    let _ = UnhookWindowsHookEx(h);
+                }
+                if let Some(h) = kbd_hook {
+                    let _ = UnhookWindowsHookEx(h);
+                }
             }
         });
 
         let thread_id = ready_rx.recv().expect("Failed to initialize hook thread");
 
         (Self { swallow, thread_id, raw_sink }, rx)
+    }
+
+    pub fn rehook(&self) -> bool {
+        unsafe {
+            PostThreadMessageW(self.thread_id, WM_REHOOK, WPARAM(0), LPARAM(0)).is_ok()
+        }
     }
 
     pub fn set_swallowing(&self, swallow: bool) {
@@ -222,4 +254,15 @@ unsafe extern "system" fn kbd_proc(n_code: i32, w_param: WPARAM, l_param: LPARAM
     }
 
     CallNextHookEx(None, n_code, w_param, l_param)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_capture_engine_rehook() {
+        let (engine, _rx) = CaptureEngine::new();
+        assert!(engine.rehook());
+    }
 }

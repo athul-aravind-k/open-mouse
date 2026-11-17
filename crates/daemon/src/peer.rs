@@ -134,6 +134,18 @@ impl PeerNode {
         let _ = self.cmd_tx.send(NodeEvent::TriggerIdentify(2500));
     }
 
+    pub fn notify_power_suspend(&self) {
+        let _ = self.cmd_tx.send(NodeEvent::PowerSuspend);
+    }
+
+    pub fn notify_power_resume(&self) {
+        let _ = self.cmd_tx.send(NodeEvent::PowerResume);
+    }
+
+    pub fn notify_display_change(&self, w: u32, h: u32) {
+        let _ = self.cmd_tx.send(NodeEvent::DisplayChanged(w, h));
+    }
+
     pub fn toggle_edge(&self) -> EdgeDirection {
         let mut cfg = self.config.lock().unwrap();
         let new_edge = match cfg.shared_edge {
@@ -172,6 +184,9 @@ enum NodeEvent {
     ClipboardChanged,
     UpdateArrangement(DisplayArrangement),
     TriggerIdentify(u32),
+    PowerSuspend,
+    PowerResume,
+    DisplayChanged(u32, u32),
 }
 
 fn run_peer_lifecycle(
@@ -348,7 +363,7 @@ fn run_peer_lifecycle(
         }
     });
 
-    let (screen_w, screen_h) = get_primary_screen_size();
+    let (mut screen_w, mut screen_h) = get_primary_screen_size();
     let mut state_machine = KvmStateMachine::new(screen_w, screen_h);
     {
         let cfg = config.lock().unwrap();
@@ -680,6 +695,85 @@ fn run_peer_lifecycle(
                         duration_ms,
                     };
                     let _ = tx.send((pkt, false));
+                }
+            }
+
+            Ok(NodeEvent::PowerSuspend) => {
+                capture.set_swallowing(false);
+                unclip_cursor();
+                injector.release_all();
+                is_controlled = false;
+                let _ = state_machine.process_event(StateEvent::EmergencyEscape);
+
+                if let Some(ref tx) = active_outgoing_tx {
+                    let _ = tx.send((Packet::EmergencyReset, false));
+                }
+
+                set_cursor_pos(screen_w / 2, screen_h / 2);
+
+                let st = if let Some(ref _tx) = active_outgoing_tx {
+                    PeerStatus::Connected {
+                        peer_name: current_peer_name.clone(),
+                        peer_addr: current_peer_addr.clone(),
+                        rtt_ms: current_rtt_ms,
+                        fingerprint: current_fingerprint.clone(),
+                    }
+                } else {
+                    let cfg = config.lock().unwrap();
+                    if cfg.peer_ip.is_empty() {
+                        PeerStatus::SearchingOnLan { port: cfg.peer_port }
+                    } else {
+                        PeerStatus::WaitingForPeer {
+                            local_ip: get_local_ip(),
+                            port: cfg.peer_port,
+                        }
+                    }
+                };
+                *status.lock().unwrap() = st.clone();
+                let _ = status_tx.send(st);
+            }
+
+            Ok(NodeEvent::PowerResume) => {
+                capture.rehook();
+                unclip_cursor();
+                injector.release_all();
+                discovery.broadcast_now();
+
+                if let Some(ref tx) = active_outgoing_tx {
+                    let now_ms = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis() as u64;
+                    let _ = tx.send((Packet::Heartbeat { timestamp_ms: now_ms }, false));
+                }
+            }
+
+            Ok(NodeEvent::DisplayChanged(new_w, new_h)) => {
+                if new_w > 0 && new_h > 0 {
+                    screen_w = new_w as i32;
+                    screen_h = new_h as i32;
+                    state_machine.set_local_screen_size(screen_w, screen_h);
+
+                    if let Some(ref tx) = active_outgoing_tx {
+                        let (device_name, my_fp) = {
+                            let cfg = config.lock().unwrap();
+                            (cfg.device_name.clone(), endpoint.cert_fingerprint().to_string())
+                        };
+                        let hello = Packet::Hello {
+                            version: 1,
+                            machine_name: device_name,
+                            screen: ScreenDescriptor {
+                                machine_id: machine_id.clone(),
+                                width_px: new_w,
+                                height_px: new_h,
+                                dpi_scale: 1.0,
+                                offset_x: 0,
+                                offset_y: 0,
+                            },
+                            cert_fingerprint: my_fp,
+                        };
+                        let _ = tx.send((hello, false));
+                    }
                 }
             }
 
