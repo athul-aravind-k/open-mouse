@@ -46,6 +46,7 @@ struct RawInputSinkState {
 }
 
 static SINK_STATE: Mutex<Option<RawInputSinkState>> = Mutex::new(None);
+static LAST_ABS: Mutex<Option<(i32, i32)>> = Mutex::new(None);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SendHwnd(pub HWND);
@@ -252,6 +253,9 @@ unsafe fn handle_raw_input(lparam: LPARAM) {
     };
 
     if !state.enabled.load(Ordering::SeqCst) {
+        if let Ok(mut g) = LAST_ABS.try_lock() {
+            *g = None;
+        }
         return;
     }
 
@@ -286,8 +290,25 @@ unsafe fn handle_raw_input(lparam: LPARAM) {
 
     let mouse = &raw.data.mouse;
 
-    // Relative movement check: MOUSE_MOVE_ABSOLUTE bit must be 0
-    if (mouse.usFlags.0 & MOUSE_MOVE_ABSOLUTE.0) == 0 {
+    // Movement: handle both relative (physical mouse) and absolute (precision touchpads)
+    if (mouse.usFlags.0 & MOUSE_MOVE_ABSOLUTE.0) != 0 {
+        if let Ok(mut last_abs_guard) = LAST_ABS.try_lock() {
+            let cur_x = mouse.lLastX;
+            let cur_y = mouse.lLastY;
+            if let Some((prev_x, prev_y)) = *last_abs_guard {
+                let (screen_w, screen_h) = crate::cursor::get_primary_screen_size();
+                let dx = (((cur_x - prev_x) as f64 / 65535.0) * screen_w as f64).round() as i32;
+                let dy = (((cur_y - prev_y) as f64 / 65535.0) * screen_h as f64).round() as i32;
+                if dx != 0 || dy != 0 {
+                    let _ = state.event_tx.send(CapturedEvent::Packet(Packet::MouseMoveRel { dx, dy }));
+                }
+            }
+            *last_abs_guard = Some((cur_x, cur_y));
+        }
+    } else {
+        if let Ok(mut last_abs_guard) = LAST_ABS.try_lock() {
+            *last_abs_guard = None;
+        }
         let dx = mouse.lLastX;
         let dy = mouse.lLastY;
         if dx != 0 || dy != 0 {

@@ -10,9 +10,9 @@ use windows::Win32::Graphics::Gdi::{
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW,
     GetSystemMetrics, KillTimer, PostQuitMessage, RegisterClassW, SetLayeredWindowAttributes,
-    SetTimer, ShowWindow, TranslateMessage, LWA_ALPHA, MSG, SM_CXSCREEN, SM_CYSCREEN,
-    WM_DESTROY, WM_PAINT, WM_TIMER, WNDCLASSW, WS_EX_LAYERED, WS_EX_TOOLWINDOW,
-    WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP, SW_SHOW,
+    SetTimer, SetWindowPos, ShowWindow, TranslateMessage, HWND_TOPMOST, LWA_ALPHA, MSG,
+    SM_CXSCREEN, SM_CYSCREEN, SWP_SHOWWINDOW, SW_SHOW, WM_DESTROY, WM_PAINT, WM_TIMER,
+    WNDCLASSW, WS_EX_LAYERED, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 
 pub fn show_identify_overlay(display_number: u32, duration_ms: u32) {
@@ -34,7 +34,7 @@ pub fn show_identify_overlay(display_number: u32, duration_ms: u32) {
         let y = (screen_h - win_size) / 2;
 
         let hwnd = CreateWindowExW(
-            WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
+            WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
             class_name,
             w!("IdentifyOverlay"),
             WS_POPUP,
@@ -51,8 +51,18 @@ pub fn show_identify_overlay(display_number: u32, duration_ms: u32) {
         if let Ok(hwnd) = hwnd {
             DISPLAY_NUMBERS.store(display_number, std::sync::atomic::Ordering::SeqCst);
             let _ = SetLayeredWindowAttributes(hwnd, COLORREF(0), 220, LWA_ALPHA);
+            let _ = SetWindowPos(
+                hwnd,
+                Some(HWND_TOPMOST),
+                x,
+                y,
+                win_size,
+                win_size,
+                SWP_SHOWWINDOW,
+            );
             let _ = ShowWindow(hwnd, SW_SHOW);
             let _ = UpdateWindow(hwnd);
+            let _ = windows::Win32::UI::WindowsAndMessaging::SetForegroundWindow(hwnd);
             let _ = SetTimer(Some(hwnd), 1, duration_ms, None);
 
             let mut msg = MSG::default();

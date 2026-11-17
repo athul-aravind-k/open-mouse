@@ -60,6 +60,10 @@ pub enum ClipFormat {
     Bitmap,
 }
 
+fn default_edge() -> u8 {
+    1
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct ScreenDescriptor {
     pub machine_id: String,
@@ -68,6 +72,8 @@ pub struct ScreenDescriptor {
     pub dpi_scale: f32,
     pub offset_x: i32,
     pub offset_y: i32,
+    #[serde(default = "default_edge")]
+    pub edge: u8,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
@@ -184,6 +190,7 @@ mod tests {
                     dpi_scale: 1.0,
                     offset_x: 0,
                     offset_y: 0,
+                    edge: 1,
                 },
                 cert_fingerprint: "AA:BB:CC:DD".to_string(),
             },

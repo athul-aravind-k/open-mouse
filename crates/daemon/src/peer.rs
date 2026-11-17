@@ -392,6 +392,13 @@ fn run_peer_lifecycle(
                         (cfg.device_name.clone(), endpoint.cert_fingerprint().to_string())
                     };
 
+                    let edge_u8 = match state_machine.arrangement().relative_edge {
+                        EdgeDirection::Left => 0,
+                        EdgeDirection::Right => 1,
+                        EdgeDirection::Top => 2,
+                        EdgeDirection::Bottom => 3,
+                    };
+
                     let hello = Packet::Hello {
                         version: 1,
                         machine_name: device_name,
@@ -400,12 +407,27 @@ fn run_peer_lifecycle(
                             width_px: screen_w as u32,
                             height_px: screen_h as u32,
                             dpi_scale: 1.0,
-                            offset_x: 0,
-                            offset_y: 0,
+                            offset_x: state_machine.arrangement().offset_x,
+                            offset_y: state_machine.arrangement().offset_y,
+                            edge: edge_u8,
                         },
                         cert_fingerprint: my_fp,
                     };
                     let _ = outgoing_tx.send((hello, false));
+
+                    let arr = state_machine.arrangement().clone();
+                    let layout_pkt = Packet::LayoutUpdate {
+                        screens: vec![ScreenDescriptor {
+                            machine_id: machine_id.clone(),
+                            width_px: screen_w as u32,
+                            height_px: screen_h as u32,
+                            dpi_scale: 1.0,
+                            offset_x: arr.offset_x,
+                            offset_y: arr.offset_y,
+                            edge: edge_u8,
+                        }],
+                    };
+                    let _ = outgoing_tx.send((layout_pkt, false));
 
                     active_outgoing_tx = Some(outgoing_tx);
                     current_peer_name = peer_addr.clone();
@@ -502,6 +524,27 @@ fn run_peer_lifecycle(
                                 cfg.trusted_fingerprints.push(cert_fingerprint.clone());
                                 let _ = crate::config::save_config(&cfg);
                             }
+                        }
+
+                        // Invert peer's layout so our local state knows where the peer is
+                        let inverse_edge = match screen.edge {
+                            0 => EdgeDirection::Right,
+                            1 => EdgeDirection::Left,
+                            2 => EdgeDirection::Bottom,
+                            3 => EdgeDirection::Top,
+                            _ => EdgeDirection::Left,
+                        };
+                        let mut local_arr = state_machine.arrangement().clone();
+                        local_arr.relative_edge = inverse_edge;
+                        local_arr.offset_x = -screen.offset_x;
+                        local_arr.offset_y = -screen.offset_y;
+                        state_machine.set_arrangement(local_arr.clone());
+
+                        {
+                            let mut cfg = config.lock().unwrap();
+                            cfg.shared_edge = inverse_edge;
+                            cfg.display_arrangement = local_arr;
+                            let _ = crate::config::save_config(&cfg);
                         }
 
                         let st = PeerStatus::Connected {
@@ -659,6 +702,31 @@ fn run_peer_lifecycle(
                         let _ = identify_tx.send((display_number, duration_ms));
                     }
 
+                    Packet::LayoutUpdate { screens } => {
+                        if let Some(scr) = screens.first() {
+                            *remote_screen.lock().unwrap() = Some(scr.clone());
+                            state_machine.set_remote_screen_size(scr.width_px, scr.height_px);
+
+                            let inverse_edge = match scr.edge {
+                                0 => EdgeDirection::Right,
+                                1 => EdgeDirection::Left,
+                                2 => EdgeDirection::Bottom,
+                                3 => EdgeDirection::Top,
+                                _ => EdgeDirection::Left,
+                            };
+                            let mut local_arr = state_machine.arrangement().clone();
+                            local_arr.relative_edge = inverse_edge;
+                            local_arr.offset_x = -scr.offset_x;
+                            local_arr.offset_y = -scr.offset_y;
+                            state_machine.set_arrangement(local_arr.clone());
+
+                            let mut cfg = config.lock().unwrap();
+                            cfg.shared_edge = inverse_edge;
+                            cfg.display_arrangement = local_arr;
+                            let _ = crate::config::save_config(&cfg);
+                        }
+                    }
+
                     _ => {}
                 }
             }
@@ -675,6 +743,12 @@ fn run_peer_lifecycle(
             Ok(NodeEvent::UpdateArrangement(arr)) => {
                 state_machine.set_arrangement(arr.clone());
                 if let Some(ref tx) = active_outgoing_tx {
+                    let edge_u8 = match arr.relative_edge {
+                        EdgeDirection::Left => 0,
+                        EdgeDirection::Right => 1,
+                        EdgeDirection::Top => 2,
+                        EdgeDirection::Bottom => 3,
+                    };
                     let pkt = Packet::LayoutUpdate {
                         screens: vec![ScreenDescriptor {
                             machine_id: machine_id.clone(),
@@ -683,6 +757,7 @@ fn run_peer_lifecycle(
                             dpi_scale: 1.0,
                             offset_x: arr.offset_x,
                             offset_y: arr.offset_y,
+                            edge: edge_u8,
                         }],
                     };
                     let _ = tx.send((pkt, false));
@@ -761,6 +836,12 @@ fn run_peer_lifecycle(
                             let cfg = config.lock().unwrap();
                             (cfg.device_name.clone(), endpoint.cert_fingerprint().to_string())
                         };
+                        let edge_u8 = match state_machine.arrangement().relative_edge {
+                            EdgeDirection::Left => 0,
+                            EdgeDirection::Right => 1,
+                            EdgeDirection::Top => 2,
+                            EdgeDirection::Bottom => 3,
+                        };
                         let hello = Packet::Hello {
                             version: 1,
                             machine_name: device_name,
@@ -769,8 +850,9 @@ fn run_peer_lifecycle(
                                 width_px: new_w,
                                 height_px: new_h,
                                 dpi_scale: 1.0,
-                                offset_x: 0,
-                                offset_y: 0,
+                                offset_x: state_machine.arrangement().offset_x,
+                                offset_y: state_machine.arrangement().offset_y,
+                                edge: edge_u8,
                             },
                             cert_fingerprint: my_fp,
                         };

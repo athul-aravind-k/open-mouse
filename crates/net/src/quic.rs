@@ -44,7 +44,11 @@ impl QuicEndpoint {
         let mut transport_config = quinn::TransportConfig::default();
         transport_config.max_idle_timeout(Some(Duration::from_secs(8).try_into().unwrap()));
         transport_config.keep_alive_interval(Some(Duration::from_secs(1)));
-        server_config.transport_config(Arc::new(transport_config));
+        transport_config.datagram_receive_buffer_size(Some(1024 * 1024));
+        transport_config.datagram_send_buffer_size(1024 * 1024);
+        let transport_config = Arc::new(transport_config);
+
+        server_config.transport_config(transport_config.clone());
 
         // 2. Client Config
         let verifier = Arc::new(PinnedCertVerifier::new(
@@ -62,7 +66,8 @@ impl QuicEndpoint {
 
         let quic_client_crypto = quinn::crypto::rustls::QuicClientConfig::try_from(client_crypto)
             .map_err(|e| e.to_string())?;
-        let client_config = ClientConfig::new(Arc::new(quic_client_crypto));
+        let mut client_config = ClientConfig::new(Arc::new(quic_client_crypto));
+        client_config.transport_config(transport_config);
 
         // 3. Endpoint
         let mut endpoint = Endpoint::server(server_config, bind_addr)
@@ -149,10 +154,9 @@ impl QuicSession {
 
     /// Sends high-frequency, loss-tolerant packets (like MouseMoveRel) via unreliable QUIC datagrams.
     pub fn send_unreliable(&self, packet: &Packet) -> Result<(), String> {
-        let bytes = serialize_packet(packet).map_err(|e| e.to_string())?;
-        self.connection
-            .send_datagram(Bytes::from(bytes))
-            .map_err(|e| e.to_string())?;
+        if let Ok(bytes) = serialize_packet(packet) {
+            let _ = self.connection.send_datagram(Bytes::from(bytes));
+        }
         Ok(())
     }
 
@@ -175,14 +179,20 @@ impl QuicSession {
     /// Reads next packet from either unreliable datagrams or reliable stream.
     pub async fn read_next_packet(&mut self) -> Result<Packet, String> {
         tokio::select! {
-            // Priority 1: Unreliable datagram (mouse delta)
-            datagram_res = self.connection.read_datagram() => {
-                let bytes = datagram_res.map_err(|e| e.to_string())?;
-                deserialize_packet(&bytes).map_err(|e| e.to_string())
-            }
-            // Priority 2: Reliable stream packet
+            biased;
+            // Priority 1: Reliable stream packet (Hello, Enter, Leave, Clicks, Keys, Clipboard)
             stream_res = read_stream_packet(&mut self.recv_stream) => {
                 stream_res
+            }
+            // Priority 2: Unreliable datagram (mouse delta)
+            datagram_res = self.connection.read_datagram() => {
+                match datagram_res {
+                    Ok(bytes) => deserialize_packet(&bytes).map_err(|e| e.to_string()),
+                    Err(_) => {
+                        // Datagram error: fall back to reading stream packet
+                        read_stream_packet(&mut self.recv_stream).await
+                    }
+                }
             }
         }
     }

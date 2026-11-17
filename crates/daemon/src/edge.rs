@@ -48,7 +48,7 @@ impl DisplayArrangement {
         screen_h: i32,
     ) -> Option<(f32, f32)> {
         match self.relative_edge {
-            EdgeDirection::Right => {
+            EdgeDirection::Left => {
                 if cur_x <= 0 {
                     let y_ratio = (cur_y as f32 / screen_h as f32).clamp(0.0, 1.0);
                     Some((0.0, y_ratio))
@@ -56,7 +56,7 @@ impl DisplayArrangement {
                     None
                 }
             }
-            EdgeDirection::Left => {
+            EdgeDirection::Right => {
                 if cur_x >= screen_w - 1 {
                     let y_ratio = (cur_y as f32 / screen_h as f32).clamp(0.0, 1.0);
                     Some((1.0, y_ratio))
@@ -65,17 +65,17 @@ impl DisplayArrangement {
                 }
             }
             EdgeDirection::Top => {
-                if cur_y >= screen_h - 1 {
+                if cur_y <= 0 {
                     let x_ratio = (cur_x as f32 / screen_w as f32).clamp(0.0, 1.0);
-                    Some((x_ratio, 1.0))
+                    Some((x_ratio, 0.0))
                 } else {
                     None
                 }
             }
             EdgeDirection::Bottom => {
-                if cur_y <= 0 {
+                if cur_y >= screen_h - 1 {
                     let x_ratio = (cur_x as f32 / screen_w as f32).clamp(0.0, 1.0);
-                    Some((x_ratio, 0.0))
+                    Some((x_ratio, 1.0))
                 } else {
                     None
                 }
@@ -291,22 +291,22 @@ mod tests {
 
     #[test]
     fn test_display_arrangement_return_boundaries() {
-        let right_arr = DisplayArrangement {
-            relative_edge: EdgeDirection::Right,
+        let left_arr = DisplayArrangement {
+            relative_edge: EdgeDirection::Left,
             offset_x: 0,
             offset_y: 100,
         };
-        // When controlled by a machine on the Right, our return edge is Left (x <= 0)
-        assert_eq!(right_arr.check_return_boundary(5, 500, 1920, 1080), None);
-        assert!(right_arr.check_return_boundary(0, 540, 1920, 1080).is_some());
+        // Peer is on the Left, our return edge is Left (x <= 0)
+        assert_eq!(left_arr.check_return_boundary(5, 500, 1920, 1080), None);
+        assert!(left_arr.check_return_boundary(0, 540, 1920, 1080).is_some());
 
-        let top_arr = DisplayArrangement {
-            relative_edge: EdgeDirection::Top,
+        let bottom_arr = DisplayArrangement {
+            relative_edge: EdgeDirection::Bottom,
             offset_x: 50,
             offset_y: 0,
         };
-        // When controlled by a machine on Top, our return edge is Bottom (y >= 1079)
-        assert_eq!(top_arr.check_return_boundary(500, 500, 1920, 1080), None);
-        assert!(top_arr.check_return_boundary(960, 1079, 1920, 1080).is_some());
+        // Peer is on Bottom, our return edge is Bottom (y >= 1079)
+        assert_eq!(bottom_arr.check_return_boundary(500, 500, 1920, 1080), None);
+        assert!(bottom_arr.check_return_boundary(960, 1079, 1920, 1080).is_some());
     }
 }

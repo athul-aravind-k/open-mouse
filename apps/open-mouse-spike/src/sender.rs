@@ -81,6 +81,7 @@ fn main() {
                 dpi_scale: 1.0,
                 offset_x: 0,
                 offset_y: 0,
+                edge: 1,
             },
             cert_fingerprint: String::new(),
         };

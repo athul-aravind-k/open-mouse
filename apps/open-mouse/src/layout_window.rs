@@ -13,12 +13,12 @@ use windows::Win32::Graphics::Gdi::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DispatchMessageW, GetClientRect, GetMessageW,
-    GetSystemMetrics, PostQuitMessage, RegisterClassW, SetForegroundWindow, SetWindowTextW,
-    ShowWindow, TranslateMessage, BS_DEFPUSHBUTTON, BS_PUSHBUTTON, HMENU, MSG,
-    SM_CXSCREEN, SM_CYSCREEN, SW_SHOW, WINDOW_EX_STYLE, WINDOW_STYLE, WM_COMMAND,
-    WM_DESTROY, WM_ERASEBKGND, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_PAINT,
-    WNDCLASSW, WS_CAPTION, WS_CHILD, WS_MINIMIZEBOX, WS_OVERLAPPED, WS_SYSMENU,
-    WS_TABSTOP, WS_VISIBLE,
+    GetSystemMetrics, KillTimer, PostQuitMessage, RegisterClassW, SetForegroundWindow,
+    SetTimer, SetWindowTextW, ShowWindow, TranslateMessage, BS_DEFPUSHBUTTON,
+    BS_PUSHBUTTON, HMENU, MSG, SM_CXSCREEN, SM_CYSCREEN, SW_SHOW, WINDOW_EX_STYLE,
+    WINDOW_STYLE, WM_COMMAND, WM_DESTROY, WM_ERASEBKGND, WM_LBUTTONDOWN, WM_LBUTTONUP,
+    WM_MOUSEMOVE, WM_PAINT, WM_TIMER, WNDCLASSW, WS_CAPTION, WS_CHILD, WS_MINIMIZEBOX,
+    WS_OVERLAPPED, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE,
 };
 
 const ID_BTN_IDENTIFY: usize = 3001;
@@ -139,6 +139,7 @@ pub fn open_layout_window(peer_node: Arc<PeerNode>) {
 
         let _ = ShowWindow(hwnd, SW_SHOW);
         let _ = SetForegroundWindow(hwnd);
+        let _ = SetTimer(Some(hwnd), 99, 500, None);
 
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
@@ -421,7 +422,21 @@ unsafe extern "system" fn layout_wnd_proc(
             let _ = EndPaint(hwnd, &ps);
             LRESULT(0)
         }
+        WM_TIMER => {
+            if let Some(ref peer) = *PEER_NODE_REF.lock().unwrap() {
+                if let Some(remote) = peer.get_remote_screen() {
+                    let mut dims = SCREEN_DIMS.lock().unwrap();
+                    if dims.2 != remote.width_px || dims.3 != remote.height_px {
+                        dims.2 = remote.width_px;
+                        dims.3 = remote.height_px;
+                        let _ = InvalidateRect(Some(hwnd), None, false);
+                    }
+                }
+            }
+            LRESULT(0)
+        }
         WM_DESTROY => {
+            let _ = KillTimer(Some(hwnd), 99);
             PostQuitMessage(0);
             LRESULT(0)
         }
@@ -430,6 +445,13 @@ unsafe extern "system" fn layout_wnd_proc(
 }
 
 fn get_monitor_canvas_rects() -> (RECT, RECT) {
+    if let Some(ref peer) = *PEER_NODE_REF.lock().unwrap() {
+        if let Some(remote) = peer.get_remote_screen() {
+            let mut dims = SCREEN_DIMS.lock().unwrap();
+            dims.2 = remote.width_px;
+            dims.3 = remote.height_px;
+        }
+    }
     let (w1, h1, w2, h2) = *SCREEN_DIMS.lock().unwrap();
     let arr = CURRENT_ARRANGEMENT.lock().unwrap().clone();
 
