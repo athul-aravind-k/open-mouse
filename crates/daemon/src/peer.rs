@@ -110,6 +110,7 @@ enum NodeEvent {
     Network(Packet),
     NetworkDisconnected,
     NewConnection(TcpStream, String),
+    ClipboardChanged,
 }
 
 fn run_peer_lifecycle(
@@ -219,6 +220,26 @@ fn run_peer_lifecycle(
                 if event_tx_capture.send(NodeEvent::LocalInput(evt)).is_err() {
                     break;
                 }
+            }
+        }
+    });
+
+    // 4. Shared clipboard listener and manager
+    let _clipboard_listener = clipboard::ClipboardListener::new();
+    let clipboard_rx = _clipboard_listener.receiver();
+    let mut clipboard_manager = clipboard::ClipboardManager::new();
+    let event_tx_clipboard = event_tx.clone();
+    let running_clipboard = running.clone();
+    thread::spawn(move || {
+        while running_clipboard.load(Ordering::SeqCst) {
+            match clipboard_rx.recv_timeout(Duration::from_millis(200)) {
+                Ok(_) => {
+                    if event_tx_clipboard.send(NodeEvent::ClipboardChanged).is_err() {
+                        break;
+                    }
+                }
+                Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
             }
         }
     });
@@ -452,7 +473,22 @@ fn run_peer_lifecycle(
                         let _ = status_tx.send(st);
                     }
 
+                    Packet::ClipboardData { format, hash, payload } => {
+                        if let Err(e) = clipboard_manager.inject_remote(format, hash, &payload) {
+                            tracing::warn!("Failed to inject remote clipboard: {}", e);
+                        }
+                    }
+
                     _ => {}
+                }
+            }
+
+            Ok(NodeEvent::ClipboardChanged) => {
+                if let Some((format, hash, payload)) = clipboard_manager.poll_local_change() {
+                    if let Some(ref mut s) = active_write_stream {
+                        let pkt = Packet::ClipboardData { format, hash, payload };
+                        let _ = write_packet_framed(s, &pkt);
+                    }
                 }
             }
 
