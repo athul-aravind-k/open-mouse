@@ -1,6 +1,6 @@
 pub mod cert;
-pub mod verifier;
 pub mod quic;
+pub mod verifier;
 
 pub use cert::{format_fingerprint, get_certs_dir, get_or_create_certificate};
 pub use quic::{QuicEndpoint, QuicSession};
@@ -18,14 +18,18 @@ mod tests {
         let server = QuicEndpoint::new(server_addr, "ServerHost", vec![]).unwrap();
         let bound_addr = server.local_addr().unwrap();
 
-        let client = QuicEndpoint::new("127.0.0.1:0".parse().unwrap(), "ClientHost", vec![]).unwrap();
+        let client =
+            QuicEndpoint::new("127.0.0.1:0".parse().unwrap(), "ClientHost", vec![]).unwrap();
 
         let server_handle = tokio::spawn(async move {
             let mut session = server.accept().await.expect("Accept failed");
             let mut received = Vec::new();
 
             for _ in 0..2 {
-                let pkt = session.read_next_packet().await.expect("Read packet failed");
+                let pkt = session
+                    .read_next_packet()
+                    .await
+                    .expect("Read packet failed");
                 received.push(pkt);
             }
             received
