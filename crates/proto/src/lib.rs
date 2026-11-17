@@ -1,6 +1,42 @@
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+pub const DISCOVERY_MAGIC: [u8; 4] = *b"OMOU";
+pub const DISCOVERY_PORT: u16 = 48898;
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct DiscoveryBeacon {
+    pub magic: [u8; 4],
+    pub version: u8,
+    pub machine_id: String,
+    pub device_name: String,
+    pub tcp_port: u16,
+}
+
+impl DiscoveryBeacon {
+    pub fn new(machine_id: String, device_name: String, tcp_port: u16) -> Self {
+        Self {
+            magic: DISCOVERY_MAGIC,
+            version: 1,
+            machine_id,
+            device_name,
+            tcp_port,
+        }
+    }
+
+    pub fn to_bytes(&self) -> Result<Vec<u8>, ProtoError> {
+        postcard::to_allocvec(self).map_err(|e| ProtoError::SerializeError(e.to_string()))
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, ProtoError> {
+        let beacon: Self = postcard::from_bytes(bytes).map_err(|e| ProtoError::DeserializeError(e.to_string()))?;
+        if beacon.magic != DISCOVERY_MAGIC || beacon.version != 1 {
+            return Err(ProtoError::DeserializeError("Invalid discovery beacon signature".to_string()));
+        }
+        Ok(beacon)
+    }
+}
+
 #[derive(Error, Debug)]
 pub enum ProtoError {
     #[error("Serialization failed: {0}")]
@@ -156,6 +192,10 @@ mod tests {
             let read_back = read_packet_framed(&mut cursor).expect("read_packet_framed failed");
             assert_eq!(pkt, read_back);
         }
+        let beacon = DiscoveryBeacon::new("id-123".to_string(), "Laptop-A".to_string(), 48899);
+        let bytes = beacon.to_bytes().expect("beacon serialization failed");
+        let decoded = DiscoveryBeacon::from_bytes(&bytes).expect("beacon deserialization failed");
+        assert_eq!(beacon, decoded);
     }
 }
 

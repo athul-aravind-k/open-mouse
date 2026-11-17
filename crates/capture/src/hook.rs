@@ -1,5 +1,5 @@
 use crossbeam_channel::{Receiver, Sender};
-use proto::{MouseBtn, Packet};
+use proto::Packet;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -32,9 +32,13 @@ struct HookState {
 
 static HOOK_STATE: Mutex<Option<HookState>> = Mutex::new(None);
 
+use crate::cursor::unclip_cursor;
+use crate::raw_input::RawInputSink;
+
 pub struct CaptureEngine {
     swallow: Arc<AtomicBool>,
     thread_id: u32,
+    raw_sink: RawInputSink,
 }
 
 impl CaptureEngine {
@@ -42,6 +46,9 @@ impl CaptureEngine {
         let (tx, rx) = crossbeam_channel::unbounded();
         let swallow = Arc::new(AtomicBool::new(false));
         let swallow_clone = swallow.clone();
+
+        let raw_sink = RawInputSink::new_with_enabled(tx.clone(), swallow.clone())
+            .expect("Failed to initialize RawInputSink");
 
         let (ready_tx, ready_rx) = crossbeam_channel::bounded(1);
 
@@ -98,7 +105,7 @@ impl CaptureEngine {
 
         let thread_id = ready_rx.recv().expect("Failed to initialize hook thread");
 
-        (Self { swallow, thread_id }, rx)
+        (Self { swallow, thread_id, raw_sink }, rx)
     }
 
     pub fn set_swallowing(&self, swallow: bool) {
@@ -108,10 +115,16 @@ impl CaptureEngine {
     pub fn is_swallowing(&self) -> bool {
         self.swallow.load(Ordering::SeqCst)
     }
+
+    pub fn raw_sink(&self) -> &RawInputSink {
+        &self.raw_sink
+    }
 }
 
 impl Drop for CaptureEngine {
     fn drop(&mut self) {
+        self.set_swallowing(false);
+        unclip_cursor();
         unsafe {
             let _ = PostThreadMessageW(self.thread_id, WM_QUIT, WPARAM(0), LPARAM(0));
         }
@@ -135,77 +148,23 @@ unsafe extern "system" fn mouse_proc(n_code: i32, w_param: WPARAM, l_param: LPAR
                 if msg_type == WM_MOUSEMOVE {
                     let cur_x = hook_struct.pt.x;
                     let cur_y = hook_struct.pt.y;
-                    let dx = cur_x - state.last_x;
-                    let dy = cur_y - state.last_y;
                     state.last_x = cur_x;
                     state.last_y = cur_y;
 
                     if swallow {
-                        if dx != 0 || dy != 0 {
-                            let _ = state.sender.send(CapturedEvent::Packet(Packet::MouseMoveRel { dx, dy }));
-                        }
+                        // Swallowing is active: cursor is parked at border.
+                        // Swallow local mouse movement (RawInputSink supplies relative mickeys).
                         return LRESULT(1);
                     } else {
                         let _ = state.sender.send(CapturedEvent::EdgeTrigger { x: cur_x, y: cur_y });
                     }
                 } else if swallow {
+                    // When swallowing is active, suppress local mouse buttons and scroll
+                    // so local desktop windows do not receive accidental clicks.
+                    // RawInputSink emits the corresponding network packets.
                     match msg_type {
-                        WM_LBUTTONDOWN => {
-                            let _ = state.sender.send(CapturedEvent::Packet(Packet::MouseButton {
-                                button: MouseBtn::Left,
-                                pressed: true,
-                            }));
-                            return LRESULT(1);
-                        }
-                        WM_LBUTTONUP => {
-                            let _ = state.sender.send(CapturedEvent::Packet(Packet::MouseButton {
-                                button: MouseBtn::Left,
-                                pressed: false,
-                            }));
-                            return LRESULT(1);
-                        }
-                        WM_RBUTTONDOWN => {
-                            let _ = state.sender.send(CapturedEvent::Packet(Packet::MouseButton {
-                                button: MouseBtn::Right,
-                                pressed: true,
-                            }));
-                            return LRESULT(1);
-                        }
-                        WM_RBUTTONUP => {
-                            let _ = state.sender.send(CapturedEvent::Packet(Packet::MouseButton {
-                                button: MouseBtn::Right,
-                                pressed: false,
-                            }));
-                            return LRESULT(1);
-                        }
-                        WM_MBUTTONDOWN => {
-                            let _ = state.sender.send(CapturedEvent::Packet(Packet::MouseButton {
-                                button: MouseBtn::Middle,
-                                pressed: true,
-                            }));
-                            return LRESULT(1);
-                        }
-                        WM_MBUTTONUP => {
-                            let _ = state.sender.send(CapturedEvent::Packet(Packet::MouseButton {
-                                button: MouseBtn::Middle,
-                                pressed: false,
-                            }));
-                            return LRESULT(1);
-                        }
-                        WM_MOUSEWHEEL => {
-                            let delta = ((hook_struct.mouseData >> 16) & 0xFFFF) as i16 as i32;
-                            let _ = state.sender.send(CapturedEvent::Packet(Packet::MouseScroll {
-                                delta_x: 0,
-                                delta_y: delta,
-                            }));
-                            return LRESULT(1);
-                        }
-                        WM_MOUSEHWHEEL => {
-                            let delta = ((hook_struct.mouseData >> 16) & 0xFFFF) as i16 as i32;
-                            let _ = state.sender.send(CapturedEvent::Packet(Packet::MouseScroll {
-                                delta_x: delta,
-                                delta_y: 0,
-                            }));
+                        WM_LBUTTONDOWN | WM_LBUTTONUP | WM_RBUTTONDOWN | WM_RBUTTONUP
+                        | WM_MBUTTONDOWN | WM_MBUTTONUP | WM_MOUSEWHEEL | WM_MOUSEHWHEEL => {
                             return LRESULT(1);
                         }
                         _ => {}

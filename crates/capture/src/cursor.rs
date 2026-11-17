@@ -61,8 +61,13 @@ impl CursorClipGuard {
     }
 
     /// Explicitly dismiss the guard without unclipping.
-    pub fn dismiss(mut self) {
+    pub fn dismiss(&mut self) {
         self.active = false;
+    }
+
+    /// Checks if the guard is currently active.
+    pub fn is_active(&self) -> bool {
+        self.active
     }
 }
 
@@ -77,6 +82,26 @@ impl Drop for CursorClipGuard {
         if self.active {
             unclip_cursor();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_cursor_clip_guard_dismiss() {
+        let mut guard = CursorClipGuard::new();
+        assert!(guard.is_active());
+        guard.dismiss();
+        assert!(!guard.is_active());
+    }
+
+    #[test]
+    fn test_cursor_metrics_read() {
+        let (w, h) = get_primary_screen_size();
+        assert!(w > 0);
+        assert!(h > 0);
     }
 }
 
