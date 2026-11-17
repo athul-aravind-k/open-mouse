@@ -124,6 +124,10 @@ pub enum Packet {
         hash: u64,
         payload: Vec<u8>,
     },
+    Identify {
+        display_number: u32,
+        duration_ms: u32,
+    },
     EmergencyReset,
 }
 
@@ -177,6 +181,10 @@ mod tests {
             Packet::Enter {
                 x_ratio: 0.0,
                 y_ratio: 0.5,
+            },
+            Packet::Identify {
+                display_number: 2,
+                duration_ms: 2500,
             },
             Packet::EmergencyReset,
         ];

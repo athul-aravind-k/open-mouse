@@ -5,7 +5,7 @@ pub mod peer;
 pub mod discovery;
 
 pub use config::{AppConfig, get_config_path, load_config, save_config};
-pub use edge::{EdgeDetector, EdgeDirection, ReturnDetector};
+pub use edge::{DisplayArrangement, EdgeDetector, EdgeDirection, ReturnDetector};
 pub use state::{DaemonState, KvmStateMachine, StateAction, StateEvent};
 pub use peer::{PeerNode, PeerStatus};
 pub use discovery::{DiscoveredPeer, DiscoveryService, should_initiate_connection};

@@ -1,3 +1,4 @@
+use crate::edge::{DisplayArrangement, EdgeDirection};
 use std::time::{Duration, Instant};
 
 /// Core states of the OpenMouse KVM daemon.
@@ -66,6 +67,9 @@ pub struct KvmStateMachine {
     state: DaemonState,
     screen_w: i32,
     screen_h: i32,
+    remote_w: i32,
+    remote_h: i32,
+    arrangement: DisplayArrangement,
     edge_trigger_margin: i32,
     return_inward_offset: i32,
     cooldown_duration: Duration,
@@ -81,12 +85,30 @@ impl KvmStateMachine {
             state: DaemonState::Local,
             screen_w,
             screen_h,
+            remote_w: screen_w,
+            remote_h: screen_h,
+            arrangement: DisplayArrangement::default(),
             edge_trigger_margin: 2,
             return_inward_offset: 10,
             cooldown_duration: Duration::from_millis(300),
             last_return_instant: None,
             entry_lockout_duration: Duration::from_millis(150),
             last_enter_instant: None,
+        }
+    }
+
+    pub fn set_arrangement(&mut self, arrangement: DisplayArrangement) {
+        self.arrangement = arrangement;
+    }
+
+    pub fn arrangement(&self) -> &DisplayArrangement {
+        &self.arrangement
+    }
+
+    pub fn set_remote_screen_size(&mut self, w: u32, h: u32) {
+        if w > 0 && h > 0 {
+            self.remote_w = w as i32;
+            self.remote_h = h as i32;
         }
     }
 
@@ -165,30 +187,128 @@ impl KvmStateMachine {
                 }
             }
 
-            // Local -> RemoteActive transition (Cursor reaches right edge)
+            // Local -> RemoteActive transition (Cursor reaches configured relative edge)
             (DaemonState::Local, StateEvent::EdgeHit { x, y }) => {
-                if x >= self.screen_w - self.edge_trigger_margin && !self.is_in_cooldown() {
-                    self.state = DaemonState::RemoteActive;
-                    let park_x = self.screen_w - 1;
-                    let park_y = y.clamp(0, self.screen_h - 1);
-                    let y_ratio = (park_y as f32 / self.screen_h as f32).clamp(0.0, 1.0);
-                    StateAction::EnterRemote {
-                        park_x,
-                        park_y,
-                        x_ratio: 0.0,
-                        y_ratio,
+                if self.is_in_cooldown() {
+                    return StateAction::None;
+                }
+
+                match self.arrangement.relative_edge {
+                    EdgeDirection::Right => {
+                        let crossing = x >= self.screen_w - self.edge_trigger_margin;
+                        let in_span = y >= self.arrangement.offset_y
+                            && y < self.arrangement.offset_y + self.remote_h;
+                        if crossing && in_span {
+                            self.state = DaemonState::RemoteActive;
+                            let park_x = self.screen_w - 1;
+                            let park_y = y.clamp(0, (self.screen_h - 1).max(0));
+                            let target_y = y - self.arrangement.offset_y;
+                            let y_ratio = (target_y as f32 / self.remote_h as f32).clamp(0.0, 1.0);
+                            StateAction::EnterRemote {
+                                park_x,
+                                park_y,
+                                x_ratio: 0.0,
+                                y_ratio,
+                            }
+                        } else {
+                            StateAction::None
+                        }
                     }
-                } else {
-                    StateAction::None
+                    EdgeDirection::Left => {
+                        let crossing = x <= self.edge_trigger_margin;
+                        let in_span = y >= self.arrangement.offset_y
+                            && y < self.arrangement.offset_y + self.remote_h;
+                        if crossing && in_span {
+                            self.state = DaemonState::RemoteActive;
+                            let park_x = 0;
+                            let park_y = y.clamp(0, (self.screen_h - 1).max(0));
+                            let target_y = y - self.arrangement.offset_y;
+                            let y_ratio = (target_y as f32 / self.remote_h as f32).clamp(0.0, 1.0);
+                            StateAction::EnterRemote {
+                                park_x,
+                                park_y,
+                                x_ratio: 1.0,
+                                y_ratio,
+                            }
+                        } else {
+                            StateAction::None
+                        }
+                    }
+                    EdgeDirection::Top => {
+                        let crossing = y <= self.edge_trigger_margin;
+                        let in_span = x >= self.arrangement.offset_x
+                            && x < self.arrangement.offset_x + self.remote_w;
+                        if crossing && in_span {
+                            self.state = DaemonState::RemoteActive;
+                            let park_x = x.clamp(0, (self.screen_w - 1).max(0));
+                            let park_y = 0;
+                            let target_x = x - self.arrangement.offset_x;
+                            let x_ratio = (target_x as f32 / self.remote_w as f32).clamp(0.0, 1.0);
+                            StateAction::EnterRemote {
+                                park_x,
+                                park_y,
+                                x_ratio,
+                                y_ratio: 1.0,
+                            }
+                        } else {
+                            StateAction::None
+                        }
+                    }
+                    EdgeDirection::Bottom => {
+                        let crossing = y >= self.screen_h - self.edge_trigger_margin;
+                        let in_span = x >= self.arrangement.offset_x
+                            && x < self.arrangement.offset_x + self.remote_w;
+                        if crossing && in_span {
+                            self.state = DaemonState::RemoteActive;
+                            let park_x = x.clamp(0, (self.screen_w - 1).max(0));
+                            let park_y = (self.screen_h - 1).max(0);
+                            let target_x = x - self.arrangement.offset_x;
+                            let x_ratio = (target_x as f32 / self.remote_w as f32).clamp(0.0, 1.0);
+                            StateAction::EnterRemote {
+                                park_x,
+                                park_y,
+                                x_ratio,
+                                y_ratio: 0.0,
+                            }
+                        } else {
+                            StateAction::None
+                        }
+                    }
                 }
             }
 
             // RemoteActive -> Local return (Peer returned control via Leave packet)
-            (DaemonState::RemoteActive, StateEvent::RemoteLeaveReceived { y_ratio, .. }) => {
+            (DaemonState::RemoteActive, StateEvent::RemoteLeaveReceived { x_ratio, y_ratio }) => {
                 self.state = DaemonState::Local;
                 self.last_return_instant = Some(Instant::now());
-                let return_x = (self.screen_w - self.return_inward_offset).max(0);
-                let return_y = (y_ratio * self.screen_h as f32).clamp(0.0, (self.screen_h - 1) as f32) as i32;
+
+                let (return_x, return_y) = match self.arrangement.relative_edge {
+                    EdgeDirection::Right => {
+                        let rx = (self.screen_w - self.return_inward_offset).max(0);
+                        let ry = ((y_ratio * self.remote_h as f32) as i32 + self.arrangement.offset_y)
+                            .clamp(0, (self.screen_h - 1).max(0));
+                        (rx, ry)
+                    }
+                    EdgeDirection::Left => {
+                        let rx = self.return_inward_offset.min((self.screen_w - 1).max(0));
+                        let ry = ((y_ratio * self.remote_h as f32) as i32 + self.arrangement.offset_y)
+                            .clamp(0, (self.screen_h - 1).max(0));
+                        (rx, ry)
+                    }
+                    EdgeDirection::Top => {
+                        let rx = ((x_ratio * self.remote_w as f32) as i32 + self.arrangement.offset_x)
+                            .clamp(0, (self.screen_w - 1).max(0));
+                        let ry = self.return_inward_offset.min((self.screen_h - 1).max(0));
+                        (rx, ry)
+                    }
+                    EdgeDirection::Bottom => {
+                        let rx = ((x_ratio * self.remote_w as f32) as i32 + self.arrangement.offset_x)
+                            .clamp(0, (self.screen_w - 1).max(0));
+                        let ry = (self.screen_h - self.return_inward_offset).max(0);
+                        (rx, ry)
+                    }
+                };
+
                 StateAction::ReturnToLocal {
                     return_x,
                     return_y,
@@ -199,8 +319,8 @@ impl KvmStateMachine {
             (DaemonState::Local, StateEvent::RemoteEnterReceived { x_ratio, y_ratio }) => {
                 self.state = DaemonState::RemoteControlled;
                 self.last_enter_instant = Some(Instant::now());
-                let target_x = ((x_ratio * self.screen_w as f32) as i32).max(1);
-                let target_y = (y_ratio * self.screen_h as f32).clamp(0.0, (self.screen_h - 1) as f32) as i32;
+                let target_x = ((x_ratio * self.screen_w as f32) as i32).max(1).min(self.screen_w - 2);
+                let target_y = ((y_ratio * self.screen_h as f32) as i32).clamp(0, (self.screen_h - 1).max(0));
                 StateAction::AcceptRemoteControl {
                     target_x,
                     target_y,

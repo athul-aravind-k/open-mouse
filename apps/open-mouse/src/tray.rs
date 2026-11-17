@@ -23,6 +23,7 @@ pub const ID_SWITCH_EDGE: usize = 2003;
 pub const ID_UNLOCK: usize = 2004;
 pub const ID_AUTOSTART: usize = 2005;
 pub const ID_EXIT: usize = 2006;
+pub const ID_ARRANGE_DISPLAYS: usize = 2007;
 
 pub struct TrayManager {
     nid: NOTIFYICONDATAW,
@@ -159,6 +160,9 @@ unsafe fn show_context_menu(hwnd: HWND) {
     let _ = AppendMenuW(menu, MF_STRING | MF_DISABLED | MF_GRAYED, ID_STATUS_HEADER, PCWSTR(status_wide.as_ptr()));
 
     let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
+
+    let arrange_str = "Arrange Displays...\0".encode_utf16().collect::<Vec<_>>();
+    let _ = AppendMenuW(menu, MF_STRING, ID_ARRANGE_DISPLAYS, PCWSTR(arrange_str.as_ptr()));
 
     let cfg_str = "Edit Config (Peer IP & Settings)\0".encode_utf16().collect::<Vec<_>>();
     let _ = AppendMenuW(menu, MF_STRING, ID_CONFIG_EDIT, PCWSTR(cfg_str.as_ptr()));

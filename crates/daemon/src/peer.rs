@@ -1,6 +1,6 @@
 use crate::config::AppConfig;
 use crate::discovery::{DiscoveryService, should_initiate_connection};
-use crate::edge::EdgeDirection;
+use crate::edge::{DisplayArrangement, EdgeDirection};
 use crate::state::{KvmStateMachine, StateAction, StateEvent};
 use capture::{
     get_cursor_pos, get_primary_screen_size, park_cursor, set_cursor_pos, unclip_cursor,
@@ -29,12 +29,18 @@ pub struct PeerNode {
     config: Arc<Mutex<AppConfig>>,
     status: Arc<Mutex<PeerStatus>>,
     status_rx: Receiver<PeerStatus>,
+    identify_rx: Receiver<(u32, u32)>,
+    remote_screen: Arc<Mutex<Option<ScreenDescriptor>>>,
+    cmd_tx: Sender<NodeEvent>,
     running: Arc<AtomicBool>,
 }
 
 impl PeerNode {
     pub fn new(initial_config: AppConfig) -> Self {
         let (status_tx, status_rx) = crossbeam_channel::unbounded();
+        let (identify_tx, identify_rx) = crossbeam_channel::unbounded();
+        let (event_tx, event_rx) = crossbeam_channel::unbounded();
+        let remote_screen = Arc::new(Mutex::new(None));
         let running = Arc::new(AtomicBool::new(true));
         let config = Arc::new(Mutex::new(initial_config));
 
@@ -55,15 +61,29 @@ impl PeerNode {
         let config_clone = config.clone();
         let status_clone = status.clone();
         let running_clone = running.clone();
+        let event_tx_clone = event_tx.clone();
+        let remote_screen_clone = remote_screen.clone();
 
         thread::spawn(move || {
-            run_peer_lifecycle(config_clone, status_clone, status_tx, running_clone);
+            run_peer_lifecycle(
+                config_clone,
+                status_clone,
+                status_tx,
+                event_tx_clone,
+                event_rx,
+                identify_tx,
+                remote_screen_clone,
+                running_clone,
+            );
         });
 
         Self {
             config,
             status,
             status_rx,
+            identify_rx,
+            remote_screen,
+            cmd_tx: event_tx,
             running,
         }
     }
@@ -76,10 +96,36 @@ impl PeerNode {
         self.status_rx.clone()
     }
 
+    pub fn identify_receiver(&self) -> Receiver<(u32, u32)> {
+        self.identify_rx.clone()
+    }
+
+    pub fn get_remote_screen(&self) -> Option<ScreenDescriptor> {
+        self.remote_screen.lock().unwrap().clone()
+    }
+
+    pub fn get_config(&self) -> AppConfig {
+        self.config.lock().unwrap().clone()
+    }
+
     pub fn update_peer_ip(&self, new_ip: String) {
         let mut cfg = self.config.lock().unwrap();
         cfg.peer_ip = new_ip;
         let _ = crate::config::save_config(&cfg);
+    }
+
+    pub fn update_arrangement(&self, arrangement: DisplayArrangement) {
+        {
+            let mut cfg = self.config.lock().unwrap();
+            cfg.shared_edge = arrangement.relative_edge;
+            cfg.display_arrangement = arrangement.clone();
+            let _ = crate::config::save_config(&cfg);
+        }
+        let _ = self.cmd_tx.send(NodeEvent::UpdateArrangement(arrangement));
+    }
+
+    pub fn trigger_identify(&self) {
+        let _ = self.cmd_tx.send(NodeEvent::TriggerIdentify(2500));
     }
 
     pub fn toggle_edge(&self) -> EdgeDirection {
@@ -90,7 +136,10 @@ impl PeerNode {
             _ => EdgeDirection::Right,
         };
         cfg.shared_edge = new_edge;
+        cfg.display_arrangement.relative_edge = new_edge;
+        let arrangement = cfg.display_arrangement.clone();
         let _ = crate::config::save_config(&cfg);
+        let _ = self.cmd_tx.send(NodeEvent::UpdateArrangement(arrangement));
         new_edge
     }
 
@@ -111,12 +160,18 @@ enum NodeEvent {
     NetworkDisconnected,
     NewConnection(TcpStream, String),
     ClipboardChanged,
+    UpdateArrangement(DisplayArrangement),
+    TriggerIdentify(u32),
 }
 
 fn run_peer_lifecycle(
     config: Arc<Mutex<AppConfig>>,
     status: Arc<Mutex<PeerStatus>>,
     status_tx: Sender<PeerStatus>,
+    event_tx: Sender<NodeEvent>,
+    event_rx: Receiver<NodeEvent>,
+    identify_tx: Sender<(u32, u32)>,
+    remote_screen: Arc<Mutex<Option<ScreenDescriptor>>>,
     running: Arc<AtomicBool>,
 ) {
     let (machine_id, device_name, port) = {
@@ -142,8 +197,6 @@ fn run_peer_lifecycle(
         device_name.clone(),
         port,
     ));
-
-    let (event_tx, event_rx) = crossbeam_channel::unbounded::<NodeEvent>();
 
     // 1. Thread for accepting incoming connections
     if let Some(listener) = listener {
@@ -246,6 +299,10 @@ fn run_peer_lifecycle(
 
     let (screen_w, screen_h) = get_primary_screen_size();
     let mut state_machine = KvmStateMachine::new(screen_w, screen_h);
+    {
+        let cfg = config.lock().unwrap();
+        state_machine.set_arrangement(cfg.display_arrangement.clone());
+    }
     let mut injector = InputInjector::new();
 
     let mut active_write_stream: Option<TcpStream> = None;
@@ -369,7 +426,9 @@ fn run_peer_lifecycle(
 
             Ok(NodeEvent::Network(pkt)) => {
                 match pkt {
-                    Packet::Hello { machine_name, .. } => {
+                    Packet::Hello { machine_name, screen, .. } => {
+                        *remote_screen.lock().unwrap() = Some(screen.clone());
+                        state_machine.set_remote_screen_size(screen.width_px, screen.height_px);
                         current_peer_name = machine_name.clone();
                         let st = PeerStatus::Connected {
                             peer_name: machine_name,
@@ -414,10 +473,12 @@ fn run_peer_lifecycle(
 
                             if entry_time.elapsed() >= entry_lockout {
                                 let (cur_x, cur_y) = get_cursor_pos();
-                                if cur_x <= 0 {
-                                    let y_ratio = (cur_y as f32 / screen_h as f32).clamp(0.0, 1.0);
+                                if let Some((x_ratio, y_ratio)) = state_machine
+                                    .arrangement()
+                                    .check_return_boundary(cur_x, cur_y, screen_w, screen_h)
+                                {
                                     let action = state_machine.process_event(StateEvent::ReturnBoundaryHit {
-                                        x_ratio: 0.0,
+                                        x_ratio,
                                         y_ratio,
                                     });
                                     if let StateAction::SendReturnToPeer { x_ratio, y_ratio } = action {
@@ -479,6 +540,10 @@ fn run_peer_lifecycle(
                         }
                     }
 
+                    Packet::Identify { display_number, duration_ms } => {
+                        let _ = identify_tx.send((display_number, duration_ms));
+                    }
+
                     _ => {}
                 }
             }
@@ -489,6 +554,34 @@ fn run_peer_lifecycle(
                         let pkt = Packet::ClipboardData { format, hash, payload };
                         let _ = write_packet_framed(s, &pkt);
                     }
+                }
+            }
+
+            Ok(NodeEvent::UpdateArrangement(arr)) => {
+                state_machine.set_arrangement(arr.clone());
+                if let Some(ref mut s) = active_write_stream {
+                    let pkt = Packet::LayoutUpdate {
+                        screens: vec![ScreenDescriptor {
+                            machine_id: machine_id.clone(),
+                            width_px: screen_w as u32,
+                            height_px: screen_h as u32,
+                            dpi_scale: 1.0,
+                            offset_x: arr.offset_x,
+                            offset_y: arr.offset_y,
+                        }],
+                    };
+                    let _ = write_packet_framed(s, &pkt);
+                }
+            }
+
+            Ok(NodeEvent::TriggerIdentify(duration_ms)) => {
+                let _ = identify_tx.send((1, duration_ms));
+                if let Some(ref mut s) = active_write_stream {
+                    let pkt = Packet::Identify {
+                        display_number: 2,
+                        duration_ms,
+                    };
+                    let _ = write_packet_framed(s, &pkt);
                 }
             }
 

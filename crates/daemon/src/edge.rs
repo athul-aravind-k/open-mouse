@@ -10,6 +10,80 @@ pub enum EdgeDirection {
     Bottom,
 }
 
+/// 2D arrangement of the remote display relative to the local primary display.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct DisplayArrangement {
+    pub relative_edge: EdgeDirection,
+    pub offset_x: i32,
+    pub offset_y: i32,
+}
+
+impl Default for DisplayArrangement {
+    fn default() -> Self {
+        Self {
+            relative_edge: EdgeDirection::Right,
+            offset_x: 0,
+            offset_y: 0,
+        }
+    }
+}
+
+impl DisplayArrangement {
+    pub fn opposite_edge(&self) -> EdgeDirection {
+        match self.relative_edge {
+            EdgeDirection::Left => EdgeDirection::Right,
+            EdgeDirection::Right => EdgeDirection::Left,
+            EdgeDirection::Top => EdgeDirection::Bottom,
+            EdgeDirection::Bottom => EdgeDirection::Top,
+        }
+    }
+
+    /// Evaluates if a remotely controlled cursor has reached the return boundary
+    /// back towards the controlling machine.
+    pub fn check_return_boundary(
+        &self,
+        cur_x: i32,
+        cur_y: i32,
+        screen_w: i32,
+        screen_h: i32,
+    ) -> Option<(f32, f32)> {
+        match self.relative_edge {
+            EdgeDirection::Right => {
+                if cur_x <= 0 {
+                    let y_ratio = (cur_y as f32 / screen_h as f32).clamp(0.0, 1.0);
+                    Some((0.0, y_ratio))
+                } else {
+                    None
+                }
+            }
+            EdgeDirection::Left => {
+                if cur_x >= screen_w - 1 {
+                    let y_ratio = (cur_y as f32 / screen_h as f32).clamp(0.0, 1.0);
+                    Some((1.0, y_ratio))
+                } else {
+                    None
+                }
+            }
+            EdgeDirection::Top => {
+                if cur_y >= screen_h - 1 {
+                    let x_ratio = (cur_x as f32 / screen_w as f32).clamp(0.0, 1.0);
+                    Some((x_ratio, 1.0))
+                } else {
+                    None
+                }
+            }
+            EdgeDirection::Bottom => {
+                if cur_y <= 0 {
+                    let x_ratio = (cur_x as f32 / screen_w as f32).clamp(0.0, 1.0);
+                    Some((x_ratio, 0.0))
+                } else {
+                    None
+                }
+            }
+        }
+    }
+}
+
 /// Detects when the cursor reaches a boundary threshold on the host machine,
 /// applying hysteresis margin and cooldown lockout.
 #[derive(Debug, Clone)]
@@ -213,5 +287,26 @@ mod tests {
         let (x_ratio, y_ratio) = hit.unwrap();
         assert_eq!(x_ratio, 0.0);
         assert!((y_ratio - 0.5).abs() < 1e-4);
+    }
+
+    #[test]
+    fn test_display_arrangement_return_boundaries() {
+        let right_arr = DisplayArrangement {
+            relative_edge: EdgeDirection::Right,
+            offset_x: 0,
+            offset_y: 100,
+        };
+        // When controlled by a machine on the Right, our return edge is Left (x <= 0)
+        assert_eq!(right_arr.check_return_boundary(5, 500, 1920, 1080), None);
+        assert!(right_arr.check_return_boundary(0, 540, 1920, 1080).is_some());
+
+        let top_arr = DisplayArrangement {
+            relative_edge: EdgeDirection::Top,
+            offset_x: 50,
+            offset_y: 0,
+        };
+        // When controlled by a machine on Top, our return edge is Bottom (y >= 1079)
+        assert_eq!(top_arr.check_return_boundary(500, 500, 1920, 1080), None);
+        assert!(top_arr.check_return_boundary(960, 1079, 1920, 1080).is_some());
     }
 }

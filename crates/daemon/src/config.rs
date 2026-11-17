@@ -1,4 +1,4 @@
-use crate::edge::EdgeDirection;
+use crate::edge::{DisplayArrangement, EdgeDirection};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
@@ -20,6 +20,8 @@ pub struct AppConfig {
     pub peer_ip: String,
     pub peer_port: u16,
     pub shared_edge: EdgeDirection,
+    #[serde(default)]
+    pub display_arrangement: DisplayArrangement,
     pub autostart: bool,
 }
 
@@ -32,6 +34,7 @@ impl Default for AppConfig {
             peer_ip: String::new(),
             peer_port: 48899,
             shared_edge: EdgeDirection::Right,
+            display_arrangement: DisplayArrangement::default(),
             autostart: false,
         }
     }
@@ -86,6 +89,11 @@ mod tests {
             peer_ip: "192.168.1.50".to_string(),
             peer_port: 48899,
             shared_edge: EdgeDirection::Right,
+            display_arrangement: DisplayArrangement {
+                relative_edge: EdgeDirection::Right,
+                offset_x: 0,
+                offset_y: 120,
+            },
             autostart: true,
         };
         let serialized = serde_json::to_string(&config).unwrap();
