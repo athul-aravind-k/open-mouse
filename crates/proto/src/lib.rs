@@ -76,6 +76,7 @@ pub enum Packet {
         version: u32,
         machine_name: String,
         screen: ScreenDescriptor,
+        cert_fingerprint: String,
     },
     LayoutUpdate {
         screens: Vec<ScreenDescriptor>,
@@ -85,6 +86,7 @@ pub enum Packet {
     },
     HeartbeatAck {
         timestamp_ms: u64,
+        echoed_timestamp_ms: u64,
     },
     Enter {
         x_ratio: f32,
@@ -168,6 +170,23 @@ mod tests {
     fn test_packet_roundtrip() {
         let packets = vec![
             Packet::Heartbeat { timestamp_ms: 123456789 },
+            Packet::HeartbeatAck {
+                timestamp_ms: 123456799,
+                echoed_timestamp_ms: 123456789,
+            },
+            Packet::Hello {
+                version: 1,
+                machine_name: "Laptop-A".to_string(),
+                screen: ScreenDescriptor {
+                    machine_id: "id-123".to_string(),
+                    width_px: 1920,
+                    height_px: 1080,
+                    dpi_scale: 1.0,
+                    offset_x: 0,
+                    offset_y: 0,
+                },
+                cert_fingerprint: "AA:BB:CC:DD".to_string(),
+            },
             Packet::MouseMoveRel { dx: -15, dy: 30 },
             Packet::MouseButton {
                 button: MouseBtn::Left,

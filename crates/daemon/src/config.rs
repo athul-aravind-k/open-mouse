@@ -22,6 +22,8 @@ pub struct AppConfig {
     pub shared_edge: EdgeDirection,
     #[serde(default)]
     pub display_arrangement: DisplayArrangement,
+    #[serde(default)]
+    pub trusted_fingerprints: Vec<String>,
     pub autostart: bool,
 }
 
@@ -35,6 +37,7 @@ impl Default for AppConfig {
             peer_port: 48899,
             shared_edge: EdgeDirection::Right,
             display_arrangement: DisplayArrangement::default(),
+            trusted_fingerprints: Vec::new(),
             autostart: false,
         }
     }
@@ -94,6 +97,7 @@ mod tests {
                 offset_x: 0,
                 offset_y: 120,
             },
+            trusted_fingerprints: vec!["AA:BB:CC".to_string()],
             autostart: true,
         };
         let serialized = serde_json::to_string(&config).unwrap();

@@ -82,6 +82,7 @@ fn main() {
                 offset_x: 0,
                 offset_y: 0,
             },
+            cert_fingerprint: String::new(),
         };
         if let Err(e) = write_packet_framed(&mut stream_write, &hello) {
             eprintln!("[Sender] Failed to send Hello: {}. Resetting connection.", e);

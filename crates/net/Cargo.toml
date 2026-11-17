@@ -9,4 +9,10 @@ proto = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
+quinn = { version = "0.11", default-features = false, features = ["rustls-ring", "runtime-tokio"] }
+rcgen = "0.13"
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
+rustls-pki-types = "1"
+ring = "0.17"
+bytes = "1"
 

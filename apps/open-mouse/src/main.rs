@@ -104,8 +104,12 @@ fn main() {
                     PeerStatus::Connecting { target } => {
                         format!("Status: Connecting to {}", target)
                     }
-                    PeerStatus::Connected { peer_name, .. } => {
-                        format!("Status: Connected to {}", peer_name)
+                    PeerStatus::Connected { peer_name, rtt_ms, .. } => {
+                        if let Some(rtt) = rtt_ms {
+                            format!("Status: Connected to {} ({:.1} ms)", peer_name, rtt)
+                        } else {
+                            format!("Status: Connected to {}", peer_name)
+                        }
                     }
                     PeerStatus::ControllingRemote => {
                         "Status: Controlling Remote Screen".to_string()

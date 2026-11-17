@@ -1,5 +1,5 @@
 use crate::config::AppConfig;
-use crate::discovery::{DiscoveryService, should_initiate_connection};
+use crate::discovery::{should_initiate_connection, DiscoveryService};
 use crate::edge::{DisplayArrangement, EdgeDirection};
 use crate::state::{KvmStateMachine, StateAction, StateEvent};
 use capture::{
@@ -8,19 +8,25 @@ use capture::{
 };
 use crossbeam_channel::{Receiver, Sender};
 use emulate::InputInjector;
-use proto::{read_packet_framed, write_packet_framed, Packet, ScreenDescriptor};
-use std::net::{TcpListener, TcpStream};
+use net::{QuicEndpoint, QuicSession};
+use proto::{Packet, ScreenDescriptor};
+use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum PeerStatus {
     SearchingOnLan { port: u16 },
     WaitingForPeer { local_ip: String, port: u16 },
     Connecting { target: String },
-    Connected { peer_name: String, peer_addr: String },
+    Connected {
+        peer_name: String,
+        peer_addr: String,
+        rtt_ms: Option<f32>,
+        fingerprint: Option<String>,
+    },
     ControllingRemote,
     RemoteControlled,
 }
@@ -158,7 +164,11 @@ enum NodeEvent {
     LocalInput(CapturedEvent),
     Network(Packet),
     NetworkDisconnected,
-    NewConnection(TcpStream, String),
+    NewQuicSession {
+        outgoing_tx: Sender<(Packet, bool)>,
+        peer_addr: String,
+    },
+    RttUpdated(f32),
     ClipboardChanged,
     UpdateArrangement(DisplayArrangement),
     TriggerIdentify(u32),
@@ -174,60 +184,80 @@ fn run_peer_lifecycle(
     remote_screen: Arc<Mutex<Option<ScreenDescriptor>>>,
     running: Arc<AtomicBool>,
 ) {
-    let (machine_id, device_name, port) = {
+    let (machine_id, device_name, port, trusted_fps) = {
         let cfg = config.lock().unwrap();
-        (cfg.machine_id.clone(), cfg.device_name.clone(), cfg.peer_port)
+        (
+            cfg.machine_id.clone(),
+            cfg.device_name.clone(),
+            cfg.peer_port,
+            cfg.trusted_fingerprints.clone(),
+        )
     };
 
-    let bind_addr = format!("0.0.0.0:{}", port);
-    let listener = match TcpListener::bind(&bind_addr) {
-        Ok(l) => {
-            l.set_nonblocking(true).ok();
-            Some(l)
-        }
+    let rt = match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
+        Ok(r) => r,
         Err(e) => {
-            eprintln!("[PeerNode] Failed to bind listener on {}: {}", bind_addr, e);
-            None
+            eprintln!("[PeerNode] Failed to build tokio runtime: {}", e);
+            return;
         }
     };
 
-    // Initialize UDP LAN Auto-Discovery
+    let bind_addr: SocketAddr = match format!("0.0.0.0:{}", port).parse() {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("[PeerNode] Invalid bind address: {}", e);
+            return;
+        }
+    };
+
+    let endpoint = match QuicEndpoint::new(bind_addr, &device_name, trusted_fps) {
+        Ok(ep) => Arc::new(ep),
+        Err(e) => {
+            eprintln!("[PeerNode] Failed to bind QUIC endpoint on {}: {}", bind_addr, e);
+            return;
+        }
+    };
+
+    // Initialize UDP LAN Auto-Discovery on port 48898
     let discovery = Arc::new(DiscoveryService::new(
         machine_id.clone(),
         device_name.clone(),
         port,
     ));
 
-    // 1. Thread for accepting incoming connections
-    if let Some(listener) = listener {
-        let event_tx_inbound = event_tx.clone();
-        let running_inbound = running.clone();
-        thread::spawn(move || {
-            while running_inbound.load(Ordering::SeqCst) {
-                match listener.accept() {
-                    Ok((stream, peer_addr)) => {
-                        stream.set_nodelay(true).ok();
-                        let _ = event_tx_inbound.send(NodeEvent::NewConnection(stream, peer_addr.to_string()));
-                    }
-                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                        thread::sleep(Duration::from_millis(100));
-                    }
-                    Err(_) => {
-                        thread::sleep(Duration::from_millis(500));
-                    }
-                }
-            }
-        });
-    }
+    // 1. Inbound QUIC accept task
+    let ep_inbound = endpoint.clone();
+    let event_tx_inbound = event_tx.clone();
+    let running_inbound = running.clone();
+    rt.spawn(async move {
+        while running_inbound.load(Ordering::SeqCst) {
+            if let Some(session) = ep_inbound.accept().await {
+                let peer_addr = session.remote_addr().to_string();
+                let (out_tx, out_rx) = crossbeam_channel::unbounded::<(Packet, bool)>();
+                let event_tx_reader = event_tx_inbound.clone();
+                let running_sess = running_inbound.clone();
 
-    // 2. Thread for outbound connection attempts (Manual IP or UDP Auto-Discovered)
+                tokio::spawn(async move {
+                    run_session_worker(session, out_rx, event_tx_reader, running_sess).await;
+                });
+
+                let _ = event_tx_inbound.send(NodeEvent::NewQuicSession {
+                    outgoing_tx: out_tx,
+                    peer_addr,
+                });
+            }
+        }
+    });
+
+    // 2. Outbound QUIC connection task (Manual IP or UDP Auto-Discovered)
+    let ep_outbound = endpoint.clone();
     let config_outbound = config.clone();
     let event_tx_outbound = event_tx.clone();
     let running_outbound = running.clone();
     let discovery_peer_rx = discovery.peer_receiver();
     let local_id = machine_id.clone();
 
-    thread::spawn(move || {
+    rt.spawn(async move {
         while running_outbound.load(Ordering::SeqCst) {
             let (manual_ip, port) = {
                 let cfg = config_outbound.lock().unwrap();
@@ -235,25 +265,46 @@ fn run_peer_lifecycle(
             };
 
             if !manual_ip.is_empty() && manual_ip != "127.0.0.1" && manual_ip != "0.0.0.0" {
-                // Manual IP specified in config
-                let target = format!("{}:{}", manual_ip, port);
-                if let Ok(stream) = TcpStream::connect(&target) {
-                    stream.set_nodelay(true).ok();
-                    let _ = event_tx_outbound.send(NodeEvent::NewConnection(stream, target));
-                    thread::sleep(Duration::from_secs(5));
+                if let Ok(target) = format!("{}:{}", manual_ip, port).parse::<SocketAddr>() {
+                    if let Ok(session) = ep_outbound.connect(target).await {
+                        let peer_addr = target.to_string();
+                        let (out_tx, out_rx) = crossbeam_channel::unbounded::<(Packet, bool)>();
+                        let event_tx_reader = event_tx_outbound.clone();
+                        let running_sess = running_outbound.clone();
+
+                        tokio::spawn(async move {
+                            run_session_worker(session, out_rx, event_tx_reader, running_sess).await;
+                        });
+
+                        let _ = event_tx_outbound.send(NodeEvent::NewQuicSession {
+                            outgoing_tx: out_tx,
+                            peer_addr,
+                        });
+                        tokio::time::sleep(Duration::from_secs(5)).await;
+                    }
                 }
-                thread::sleep(Duration::from_secs(3));
+                tokio::time::sleep(Duration::from_secs(3)).await;
             } else {
-                // Auto-discovery mode: process discovered beacons
                 match discovery_peer_rx.recv_timeout(Duration::from_millis(500)) {
                     Ok(peer) => {
-                        // Tie-breaker: only connect if our machine ID is smaller
                         if should_initiate_connection(&local_id, &peer.machine_id) {
-                            let target = format!("{}:{}", peer.ip, peer.port);
-                            if let Ok(stream) = TcpStream::connect(&target) {
-                                stream.set_nodelay(true).ok();
-                                let _ = event_tx_outbound.send(NodeEvent::NewConnection(stream, target));
-                                thread::sleep(Duration::from_secs(5));
+                            if let Ok(target) = format!("{}:{}", peer.ip, peer.port).parse::<SocketAddr>() {
+                                if let Ok(session) = ep_outbound.connect(target).await {
+                                    let peer_addr = target.to_string();
+                                    let (out_tx, out_rx) = crossbeam_channel::unbounded::<(Packet, bool)>();
+                                    let event_tx_reader = event_tx_outbound.clone();
+                                    let running_sess = running_outbound.clone();
+
+                                    tokio::spawn(async move {
+                                        run_session_worker(session, out_rx, event_tx_reader, running_sess).await;
+                                    });
+
+                                    let _ = event_tx_outbound.send(NodeEvent::NewQuicSession {
+                                        outgoing_tx: out_tx,
+                                        peer_addr,
+                                    });
+                                    tokio::time::sleep(Duration::from_secs(5)).await;
+                                }
                             }
                         }
                     }
@@ -305,25 +356,25 @@ fn run_peer_lifecycle(
     }
     let mut injector = InputInjector::new();
 
-    let mut active_write_stream: Option<TcpStream> = None;
+    let mut active_outgoing_tx: Option<Sender<(Packet, bool)>> = None;
     let mut current_peer_name = String::new();
+    let mut current_peer_addr = String::new();
+    let mut current_rtt_ms: Option<f32> = None;
+    let mut current_fingerprint: Option<String> = None;
     let mut is_controlled = false;
     let mut entry_time = Instant::now();
     let entry_lockout = Duration::from_millis(150);
 
     while running.load(Ordering::SeqCst) {
         match event_rx.recv_timeout(Duration::from_millis(100)) {
-            Ok(NodeEvent::NewConnection(stream, addr_str)) => {
-                // If we don't already have an active stream, adopt this one
-                if active_write_stream.is_none() {
-                    let mut write_stream = match stream.try_clone() {
-                        Ok(s) => s,
-                        Err(_) => continue,
-                    };
-                    let mut read_stream = stream;
-
+            Ok(NodeEvent::NewQuicSession { outgoing_tx, peer_addr }) => {
+                if active_outgoing_tx.is_none() {
                     // Send Hello packet
-                    let device_name = config.lock().unwrap().device_name.clone();
+                    let (device_name, my_fp) = {
+                        let cfg = config.lock().unwrap();
+                        (cfg.device_name.clone(), endpoint.cert_fingerprint().to_string())
+                    };
+
                     let hello = Packet::Hello {
                         version: 1,
                         machine_name: device_name,
@@ -335,59 +386,55 @@ fn run_peer_lifecycle(
                             offset_x: 0,
                             offset_y: 0,
                         },
+                        cert_fingerprint: my_fp,
                     };
-                    let _ = write_packet_framed(&mut write_stream, &hello);
+                    let _ = outgoing_tx.send((hello, false));
 
-                    active_write_stream = Some(write_stream);
-                    current_peer_name = addr_str.clone();
+                    active_outgoing_tx = Some(outgoing_tx);
+                    current_peer_name = peer_addr.clone();
+                    current_peer_addr = peer_addr.clone();
                     state_machine.process_event(StateEvent::Connected);
                     discovery.set_connected(true);
 
                     let new_status = PeerStatus::Connected {
-                        peer_name: addr_str.clone(),
-                        peer_addr: addr_str,
+                        peer_name: peer_addr.clone(),
+                        peer_addr,
+                        rtt_ms: None,
+                        fingerprint: None,
                     };
                     *status.lock().unwrap() = new_status.clone();
                     let _ = status_tx.send(new_status);
+                }
+            }
 
-                    // Background thread: read from this stream
-                    let event_tx_reader = event_tx.clone();
-                    thread::spawn(move || {
-                        loop {
-                            match read_packet_framed(&mut read_stream) {
-                                Ok(pkt) => {
-                                    if event_tx_reader.send(NodeEvent::Network(pkt)).is_err() {
-                                        break;
-                                    }
-                                }
-                                Err(_) => {
-                                    let _ = event_tx_reader.send(NodeEvent::NetworkDisconnected);
-                                    break;
-                                }
-                            }
-                        }
-                    });
+            Ok(NodeEvent::RttUpdated(rtt)) => {
+                current_rtt_ms = Some(rtt);
+                if let PeerStatus::Connected { .. } = *status.lock().unwrap() {
+                    let st = PeerStatus::Connected {
+                        peer_name: current_peer_name.clone(),
+                        peer_addr: current_peer_addr.clone(),
+                        rtt_ms: current_rtt_ms,
+                        fingerprint: current_fingerprint.clone(),
+                    };
+                    *status.lock().unwrap() = st.clone();
+                    let _ = status_tx.send(st);
                 }
             }
 
             Ok(NodeEvent::LocalInput(CapturedEvent::EdgeTrigger { x, y })) => {
-                if active_write_stream.is_some() && !state_machine.is_remote_active() {
+                if active_outgoing_tx.is_some() && !state_machine.is_remote_active() {
                     let action = state_machine.process_event(StateEvent::EdgeHit { x, y });
                     if let StateAction::EnterRemote { park_x, park_y, x_ratio, y_ratio } = action {
                         capture.set_swallowing(true);
                         park_cursor(park_x, park_y);
 
-                        if let Some(ref mut s) = active_write_stream {
+                        if let Some(ref tx) = active_outgoing_tx {
                             let enter_pkt = Packet::Enter { x_ratio, y_ratio };
-                            if write_packet_framed(s, &enter_pkt).is_err() {
-                                capture.set_swallowing(false);
-                                unclip_cursor();
-                                state_machine.process_event(StateEvent::EmergencyResetReceived);
-                            } else {
-                                let st = PeerStatus::ControllingRemote;
-                                *status.lock().unwrap() = st.clone();
-                                let _ = status_tx.send(st);
-                            }
+                            let _ = tx.send((enter_pkt, false));
+
+                            let st = PeerStatus::ControllingRemote;
+                            *status.lock().unwrap() = st.clone();
+                            let _ = status_tx.send(st);
                         }
                     }
                 }
@@ -395,12 +442,9 @@ fn run_peer_lifecycle(
 
             Ok(NodeEvent::LocalInput(CapturedEvent::Packet(pkt))) => {
                 if state_machine.is_remote_active() {
-                    if let Some(ref mut s) = active_write_stream {
-                        if write_packet_framed(s, &pkt).is_err() {
-                            capture.set_swallowing(false);
-                            unclip_cursor();
-                            state_machine.process_event(StateEvent::EmergencyResetReceived);
-                        }
+                    if let Some(ref tx) = active_outgoing_tx {
+                        let is_unreliable = matches!(pkt, Packet::MouseMoveRel { .. });
+                        let _ = tx.send((pkt, is_unreliable));
                     }
                 }
             }
@@ -412,13 +456,15 @@ fn run_peer_lifecycle(
                 injector.release_all();
                 state_machine.process_event(StateEvent::EmergencyEscape);
 
-                if let Some(ref mut s) = active_write_stream {
-                    let _ = write_packet_framed(s, &Packet::EmergencyReset);
+                if let Some(ref tx) = active_outgoing_tx {
+                    let _ = tx.send((Packet::EmergencyReset, false));
                 }
 
                 let st = PeerStatus::Connected {
                     peer_name: current_peer_name.clone(),
-                    peer_addr: current_peer_name.clone(),
+                    peer_addr: current_peer_addr.clone(),
+                    rtt_ms: current_rtt_ms,
+                    fingerprint: current_fingerprint.clone(),
                 };
                 *status.lock().unwrap() = st.clone();
                 let _ = status_tx.send(st);
@@ -426,16 +472,62 @@ fn run_peer_lifecycle(
 
             Ok(NodeEvent::Network(pkt)) => {
                 match pkt {
-                    Packet::Hello { machine_name, screen, .. } => {
+                    Packet::Hello { machine_name, screen, cert_fingerprint, .. } => {
                         *remote_screen.lock().unwrap() = Some(screen.clone());
                         state_machine.set_remote_screen_size(screen.width_px, screen.height_px);
                         current_peer_name = machine_name.clone();
+                        current_fingerprint = Some(cert_fingerprint.clone());
+
+                        // TOFU: pin fingerprint in configuration
+                        {
+                            let mut cfg = config.lock().unwrap();
+                            if !cfg.trusted_fingerprints.contains(&cert_fingerprint) {
+                                cfg.trusted_fingerprints.push(cert_fingerprint.clone());
+                                let _ = crate::config::save_config(&cfg);
+                            }
+                        }
+
                         let st = PeerStatus::Connected {
                             peer_name: machine_name,
-                            peer_addr: current_peer_name.clone(),
+                            peer_addr: current_peer_addr.clone(),
+                            rtt_ms: current_rtt_ms,
+                            fingerprint: current_fingerprint.clone(),
                         };
                         *status.lock().unwrap() = st.clone();
                         let _ = status_tx.send(st);
+                    }
+
+                    Packet::Heartbeat { timestamp_ms } => {
+                        let now_ms = SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_millis() as u64;
+                        let ack = Packet::HeartbeatAck {
+                            timestamp_ms: now_ms,
+                            echoed_timestamp_ms: timestamp_ms,
+                        };
+                        if let Some(ref tx) = active_outgoing_tx {
+                            let _ = tx.send((ack, false));
+                        }
+                    }
+
+                    Packet::HeartbeatAck { echoed_timestamp_ms, .. } => {
+                        let now_ms = SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_millis() as u64;
+                        if now_ms >= echoed_timestamp_ms {
+                            let rtt = (now_ms - echoed_timestamp_ms) as f32;
+                            current_rtt_ms = Some(rtt);
+                            let st = PeerStatus::Connected {
+                                peer_name: current_peer_name.clone(),
+                                peer_addr: current_peer_addr.clone(),
+                                rtt_ms: current_rtt_ms,
+                                fingerprint: current_fingerprint.clone(),
+                            };
+                            *status.lock().unwrap() = st.clone();
+                            let _ = status_tx.send(st);
+                        }
                     }
 
                     Packet::Enter { x_ratio, y_ratio } => {
@@ -460,7 +552,9 @@ fn run_peer_lifecycle(
 
                             let st = PeerStatus::Connected {
                                 peer_name: current_peer_name.clone(),
-                                peer_addr: current_peer_name.clone(),
+                                peer_addr: current_peer_addr.clone(),
+                                rtt_ms: current_rtt_ms,
+                                fingerprint: current_fingerprint.clone(),
                             };
                             *status.lock().unwrap() = st.clone();
                             let _ = status_tx.send(st);
@@ -485,13 +579,15 @@ fn run_peer_lifecycle(
                                         is_controlled = false;
                                         injector.release_all();
 
-                                        if let Some(ref mut s) = active_write_stream {
-                                            let _ = write_packet_framed(s, &Packet::Leave { x_ratio, y_ratio });
+                                        if let Some(ref tx) = active_outgoing_tx {
+                                            let _ = tx.send((Packet::Leave { x_ratio, y_ratio }, false));
                                         }
 
                                         let st = PeerStatus::Connected {
                                             peer_name: current_peer_name.clone(),
-                                            peer_addr: current_peer_name.clone(),
+                                            peer_addr: current_peer_addr.clone(),
+                                            rtt_ms: current_rtt_ms,
+                                            fingerprint: current_fingerprint.clone(),
                                         };
                                         *status.lock().unwrap() = st.clone();
                                         let _ = status_tx.send(st);
@@ -528,7 +624,9 @@ fn run_peer_lifecycle(
 
                         let st = PeerStatus::Connected {
                             peer_name: current_peer_name.clone(),
-                            peer_addr: current_peer_name.clone(),
+                            peer_addr: current_peer_addr.clone(),
+                            rtt_ms: current_rtt_ms,
+                            fingerprint: current_fingerprint.clone(),
                         };
                         *status.lock().unwrap() = st.clone();
                         let _ = status_tx.send(st);
@@ -550,16 +648,16 @@ fn run_peer_lifecycle(
 
             Ok(NodeEvent::ClipboardChanged) => {
                 if let Some((format, hash, payload)) = clipboard_manager.poll_local_change() {
-                    if let Some(ref mut s) = active_write_stream {
+                    if let Some(ref tx) = active_outgoing_tx {
                         let pkt = Packet::ClipboardData { format, hash, payload };
-                        let _ = write_packet_framed(s, &pkt);
+                        let _ = tx.send((pkt, false));
                     }
                 }
             }
 
             Ok(NodeEvent::UpdateArrangement(arr)) => {
                 state_machine.set_arrangement(arr.clone());
-                if let Some(ref mut s) = active_write_stream {
+                if let Some(ref tx) = active_outgoing_tx {
                     let pkt = Packet::LayoutUpdate {
                         screens: vec![ScreenDescriptor {
                             machine_id: machine_id.clone(),
@@ -570,23 +668,23 @@ fn run_peer_lifecycle(
                             offset_y: arr.offset_y,
                         }],
                     };
-                    let _ = write_packet_framed(s, &pkt);
+                    let _ = tx.send((pkt, false));
                 }
             }
 
             Ok(NodeEvent::TriggerIdentify(duration_ms)) => {
                 let _ = identify_tx.send((1, duration_ms));
-                if let Some(ref mut s) = active_write_stream {
+                if let Some(ref tx) = active_outgoing_tx {
                     let pkt = Packet::Identify {
                         display_number: 2,
                         duration_ms,
                     };
-                    let _ = write_packet_framed(s, &pkt);
+                    let _ = tx.send((pkt, false));
                 }
             }
 
             Ok(NodeEvent::NetworkDisconnected) => {
-                active_write_stream = None;
+                active_outgoing_tx = None;
                 is_controlled = false;
                 capture.set_swallowing(false);
                 unclip_cursor();
@@ -620,6 +718,74 @@ fn run_peer_lifecycle(
     capture.set_swallowing(false);
     unclip_cursor();
     injector.release_all();
+}
+
+async fn run_session_worker(
+    mut session: QuicSession,
+    out_rx: Receiver<(Packet, bool)>,
+    event_tx: Sender<NodeEvent>,
+    running: Arc<AtomicBool>,
+) {
+    let mut interval = tokio::time::interval(Duration::from_millis(1000));
+
+    loop {
+        if !running.load(Ordering::SeqCst) {
+            break;
+        }
+
+        tokio::select! {
+            // Read incoming packet from QUIC session
+            pkt_res = session.read_next_packet() => {
+                match pkt_res {
+                    Ok(pkt) => {
+                        if event_tx.send(NodeEvent::Network(pkt)).is_err() {
+                            break;
+                        }
+                    }
+                    Err(_) => {
+                        let _ = event_tx.send(NodeEvent::NetworkDisconnected);
+                        break;
+                    }
+                }
+            }
+
+            // Write queued outgoing packets to QUIC session
+            out_item = async {
+                tokio::task::spawn_blocking({
+                    let out_rx = out_rx.clone();
+                    move || out_rx.recv_timeout(Duration::from_millis(100))
+                }).await.unwrap_or(Err(crossbeam_channel::RecvTimeoutError::Timeout))
+            } => {
+                if let Ok((pkt, unreliable)) = out_item {
+                    let res = if unreliable {
+                        session.send_unreliable(&pkt)
+                    } else {
+                        session.send_reliable(&pkt).await
+                    };
+                    if res.is_err() {
+                        let _ = event_tx.send(NodeEvent::NetworkDisconnected);
+                        break;
+                    }
+                }
+            }
+
+            // 1-second keepalive & latency check
+            _ = interval.tick() => {
+                let rtt_ms = session.rtt().as_secs_f32() * 1000.0;
+                let _ = event_tx.send(NodeEvent::RttUpdated(rtt_ms));
+
+                let now_ms = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as u64;
+
+                if session.send_reliable(&Packet::Heartbeat { timestamp_ms: now_ms }).await.is_err() {
+                    let _ = event_tx.send(NodeEvent::NetworkDisconnected);
+                    break;
+                }
+            }
+        }
+    }
 }
 
 pub fn get_local_ip() -> String {
