@@ -3,8 +3,9 @@ pub mod quic;
 pub mod verifier;
 
 pub use cert::{format_fingerprint, get_certs_dir, get_or_create_certificate};
-pub use quic::{QuicEndpoint, QuicSession};
+pub use quic::{read_stream_packet, write_stream_packet, QuicEndpoint, QuicSession};
 pub use verifier::PinnedCertVerifier;
+pub use quinn;
 
 #[cfg(test)]
 mod tests {

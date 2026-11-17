@@ -61,12 +61,11 @@ impl DiscoveryService {
             };
 
             while running_bcast.load(Ordering::SeqCst) {
-                if !connected_bcast.load(Ordering::SeqCst) {
-                    for target in get_broadcast_targets() {
-                        let _ = socket.send_to(&beacon_bytes, &target);
-                    }
+                for target in get_broadcast_targets() {
+                    let _ = socket.send_to(&beacon_bytes, &target);
                 }
-                thread::sleep(Duration::from_millis(1500));
+                let sleep_ms = if connected_bcast.load(Ordering::SeqCst) { 4000 } else { 1500 };
+                thread::sleep(Duration::from_millis(sleep_ms));
             }
         });
 

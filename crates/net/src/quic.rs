@@ -144,6 +144,10 @@ impl QuicSession {
         })
     }
 
+    pub fn into_parts(self) -> (SendStream, RecvStream, Connection) {
+        (self.send_stream, self.recv_stream, self.connection)
+    }
+
     pub fn remote_addr(&self) -> SocketAddr {
         self.connection.remote_address()
     }
@@ -162,18 +166,7 @@ impl QuicSession {
 
     /// Sends critical packets (Keys, Clicks, Enter, Leave, Clipboard, Heartbeats) via reliable ordered stream.
     pub async fn send_reliable(&mut self, packet: &Packet) -> Result<(), String> {
-        let payload = serialize_packet(packet).map_err(|e| e.to_string())?;
-        let len = payload.len() as u32;
-        self.send_stream
-            .write_all(&len.to_le_bytes())
-            .await
-            .map_err(|e| e.to_string())?;
-        self.send_stream
-            .write_all(&payload)
-            .await
-            .map_err(|e| e.to_string())?;
-        self.send_stream.flush().await.map_err(|e| e.to_string())?;
-        Ok(())
+        write_stream_packet(&mut self.send_stream, packet).await
     }
 
     /// Reads next packet from either unreliable datagrams or reliable stream.
@@ -198,7 +191,22 @@ impl QuicSession {
     }
 }
 
-async fn read_stream_packet(stream: &mut RecvStream) -> Result<Packet, String> {
+pub async fn write_stream_packet(stream: &mut SendStream, packet: &Packet) -> Result<(), String> {
+    let payload = serialize_packet(packet).map_err(|e| e.to_string())?;
+    let len = payload.len() as u32;
+    stream
+        .write_all(&len.to_le_bytes())
+        .await
+        .map_err(|e| e.to_string())?;
+    stream
+        .write_all(&payload)
+        .await
+        .map_err(|e| e.to_string())?;
+    stream.flush().await.map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+pub async fn read_stream_packet(stream: &mut RecvStream) -> Result<Packet, String> {
     let mut len_bytes = [0u8; 4];
     stream
         .read_exact(&mut len_bytes)

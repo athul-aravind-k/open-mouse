@@ -167,6 +167,7 @@ fn main() {
                     }
                 };
 
+                append_log(&format!("[Peer Status] {}", status_text));
                 *CURRENT_STATUS_TEXT.lock().unwrap() = Some(status_text);
             }
         }
