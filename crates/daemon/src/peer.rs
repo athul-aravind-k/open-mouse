@@ -177,7 +177,7 @@ enum NodeEvent {
     Network(Packet),
     NetworkDisconnected,
     NewQuicSession {
-        outgoing_tx: Sender<(Packet, bool)>,
+        outgoing_tx: tokio::sync::mpsc::UnboundedSender<(Packet, bool)>,
         peer_addr: String,
     },
     RttUpdated(f32),
@@ -225,6 +225,8 @@ fn run_peer_lifecycle(
         }
     };
 
+    let _rt_guard = rt.enter();
+
     let endpoint = match QuicEndpoint::new(bind_addr, &device_name, trusted_fps) {
         Ok(ep) => Arc::new(ep),
         Err(e) => {
@@ -248,7 +250,7 @@ fn run_peer_lifecycle(
         while running_inbound.load(Ordering::SeqCst) {
             if let Some(session) = ep_inbound.accept().await {
                 let peer_addr = session.remote_addr().to_string();
-                let (out_tx, out_rx) = crossbeam_channel::unbounded::<(Packet, bool)>();
+                let (out_tx, out_rx) = tokio::sync::mpsc::unbounded_channel::<(Packet, bool)>();
                 let event_tx_reader = event_tx_inbound.clone();
                 let running_sess = running_inbound.clone();
 
@@ -283,7 +285,7 @@ fn run_peer_lifecycle(
                 if let Ok(target) = format!("{}:{}", manual_ip, port).parse::<SocketAddr>() {
                     if let Ok(session) = ep_outbound.connect(target).await {
                         let peer_addr = target.to_string();
-                        let (out_tx, out_rx) = crossbeam_channel::unbounded::<(Packet, bool)>();
+                        let (out_tx, out_rx) = tokio::sync::mpsc::unbounded_channel::<(Packet, bool)>();
                         let event_tx_reader = event_tx_outbound.clone();
                         let running_sess = running_outbound.clone();
 
@@ -306,7 +308,7 @@ fn run_peer_lifecycle(
                             if let Ok(target) = format!("{}:{}", peer.ip, peer.port).parse::<SocketAddr>() {
                                 if let Ok(session) = ep_outbound.connect(target).await {
                                     let peer_addr = target.to_string();
-                                    let (out_tx, out_rx) = crossbeam_channel::unbounded::<(Packet, bool)>();
+                                    let (out_tx, out_rx) = tokio::sync::mpsc::unbounded_channel::<(Packet, bool)>();
                                     let event_tx_reader = event_tx_outbound.clone();
                                     let running_sess = running_outbound.clone();
 
@@ -371,7 +373,7 @@ fn run_peer_lifecycle(
     }
     let mut injector = InputInjector::new();
 
-    let mut active_outgoing_tx: Option<Sender<(Packet, bool)>> = None;
+    let mut active_outgoing_tx: Option<tokio::sync::mpsc::UnboundedSender<(Packet, bool)>> = None;
     let mut current_peer_name = String::new();
     let mut current_peer_addr = String::new();
     let mut current_rtt_ms: Option<f32> = None;
@@ -816,7 +818,7 @@ fn run_peer_lifecycle(
 
 async fn run_session_worker(
     mut session: QuicSession,
-    out_rx: Receiver<(Packet, bool)>,
+    mut out_rx: tokio::sync::mpsc::UnboundedReceiver<(Packet, bool)>,
     event_tx: Sender<NodeEvent>,
     running: Arc<AtomicBool>,
 ) {
@@ -844,22 +846,15 @@ async fn run_session_worker(
             }
 
             // Write queued outgoing packets to QUIC session
-            out_item = async {
-                tokio::task::spawn_blocking({
-                    let out_rx = out_rx.clone();
-                    move || out_rx.recv_timeout(Duration::from_millis(100))
-                }).await.unwrap_or(Err(crossbeam_channel::RecvTimeoutError::Timeout))
-            } => {
-                if let Ok((pkt, unreliable)) = out_item {
-                    let res = if unreliable {
-                        session.send_unreliable(&pkt)
-                    } else {
-                        session.send_reliable(&pkt).await
-                    };
-                    if res.is_err() {
-                        let _ = event_tx.send(NodeEvent::NetworkDisconnected);
-                        break;
-                    }
+            Some((pkt, unreliable)) = out_rx.recv() => {
+                let res = if unreliable {
+                    session.send_unreliable(&pkt)
+                } else {
+                    session.send_reliable(&pkt).await
+                };
+                if res.is_err() {
+                    let _ = event_tx.send(NodeEvent::NetworkDisconnected);
+                    break;
                 }
             }
 

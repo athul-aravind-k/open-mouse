@@ -3,7 +3,7 @@ use windows::core::w;
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, CreateFontW, CreateSolidBrush, DeleteObject, DrawTextW, EndPaint,
-    FillRect, GetStockObject, SelectObject, SetBkMode, SetTextColor, DT_CENTER,
+    FillRect, GetStockObject, SelectObject, SetBkMode, SetTextColor, UpdateWindow, DT_CENTER,
     DT_SINGLELINE, DT_VCENTER, FONT_CHARSET, FONT_CLIP_PRECISION, FONT_OUTPUT_PRECISION,
     FONT_QUALITY, FW_BOLD, HBRUSH, HGDIOBJ, PAINTSTRUCT, TRANSPARENT, WHITE_BRUSH,
 };
@@ -49,8 +49,10 @@ pub fn show_identify_overlay(display_number: u32, duration_ms: u32) {
         );
 
         if let Ok(hwnd) = hwnd {
+            DISPLAY_NUMBERS.store(display_number, std::sync::atomic::Ordering::SeqCst);
             let _ = SetLayeredWindowAttributes(hwnd, COLORREF(0), 220, LWA_ALPHA);
             let _ = ShowWindow(hwnd, SW_SHOW);
+            let _ = UpdateWindow(hwnd);
             let _ = SetTimer(Some(hwnd), 1, duration_ms, None);
 
             let mut msg = MSG::default();

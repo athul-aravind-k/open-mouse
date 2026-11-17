@@ -13,11 +13,25 @@ use std::thread;
 use tray::{
     run_message_loop, TrayEvent, TrayManager, AUTOSTART_ENABLED, CURRENT_EDGE_TEXT,
     CURRENT_STATUS_TEXT, ID_ARRANGE_DISPLAYS, ID_AUTOSTART, ID_CONFIG_EDIT, ID_EXIT,
-    ID_SETUP_FIREWALL, ID_SWITCH_EDGE, ID_UNLOCK,
+    ID_SETUP_FIREWALL, ID_SWITCH_EDGE, ID_UNLOCK, ID_VIEW_LOGS,
 };
 use windows::Win32::UI::WindowsAndMessaging::PostQuitMessage;
 
+pub fn append_log(msg: &str) {
+    let log_path = daemon::get_config_path().parent().unwrap().join("open-mouse.log");
+    use std::io::Write;
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&log_path) {
+        let _ = writeln!(f, "[{}] {}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis(), msg);
+    }
+}
+
 fn main() {
+    append_log("OpenMouse starting...");
+
+    std::panic::set_hook(Box::new(move |info| {
+        append_log(&format!("PANIC: {:?}", info));
+    }));
+
     // Enable Per-Monitor DPI Awareness v2
     unsafe {
         let _ = windows::Win32::UI::HiDpi::SetProcessDpiAwarenessContext(
@@ -25,6 +39,7 @@ fn main() {
         );
     }
 
+    append_log("DPI context set. Loading config...");
     let config = load_config();
     let autostart_active = autostart::is_autostart_enabled();
 
@@ -33,11 +48,14 @@ fn main() {
     *AUTOSTART_ENABLED.lock().unwrap() = autostart_active;
 
     let running = Arc::new(AtomicBool::new(true));
+    append_log("Creating PeerNode...");
     let peer_node = Arc::new(PeerNode::new(config.clone()));
+    append_log("PeerNode created.");
 
     let peer_node_cb = peer_node.clone();
     let running_cb = running.clone();
 
+    append_log("Creating TrayManager...");
     let mut tray_mgr = TrayManager::new("OpenMouse - Software KVM", move |event| {
         match event {
             TrayEvent::Command(cmd_id) => match cmd_id {
@@ -75,6 +93,10 @@ fn main() {
                 }
                 ID_SETUP_FIREWALL => {
                     launch_firewall_setup();
+                }
+                ID_VIEW_LOGS => {
+                    let log_path = daemon::get_config_path().parent().unwrap().join("open-mouse.log");
+                    let _ = Command::new("notepad.exe").arg(log_path).spawn();
                 }
                 _ => {}
             },
@@ -122,7 +144,7 @@ fn main() {
             if let Ok(st) = status_rx.recv() {
                 let status_text = match st {
                     PeerStatus::SearchingOnLan { port } => {
-                        format!("Status: Searching for peers on LAN (Port {})", port)
+                        format!("Status: Searching on LAN (Local: {}, Port {})", daemon::get_local_ip(), port)
                     }
                     PeerStatus::WaitingForPeer { local_ip, port } => {
                         format!("Status: Listening on {}:{}", local_ip, port)
@@ -150,7 +172,9 @@ fn main() {
         }
     });
 
+    append_log("Starting run_message_loop...");
     run_message_loop(running);
+    append_log("run_message_loop exited. Main terminating.");
 }
 
 fn find_firewall_script() -> Option<std::path::PathBuf> {
@@ -174,7 +198,14 @@ fn find_firewall_script() -> Option<std::path::PathBuf> {
 }
 
 fn launch_firewall_setup() {
-    let script_path = find_firewall_script().unwrap_or_else(|| std::path::PathBuf::from("scripts/setup-firewall.ps1"));
+    let arg_str = if let Some(script_path) = find_firewall_script() {
+        format!(
+            "-NoProfile -ExecutionPolicy Bypass -File \"{}\"",
+            script_path.display()
+        )
+    } else {
+        "-NoProfile -ExecutionPolicy Bypass -Command \"Write-Host 'Configuring OpenMouse firewall rules...'; Remove-NetFirewallRule -DisplayName 'OpenMouse LAN Discovery' -ErrorAction SilentlyContinue; Remove-NetFirewallRule -DisplayName 'OpenMouse QUIC Transport' -ErrorAction SilentlyContinue; New-NetFirewallRule -DisplayName 'OpenMouse LAN Discovery' -Description 'Inbound UDP discovery' -Direction Inbound -Action Allow -Protocol UDP -LocalPort 48898 -Profile Domain,Private,Public; New-NetFirewallRule -DisplayName 'OpenMouse QUIC Transport' -Description 'Inbound QUIC transport' -Direction Inbound -Action Allow -Protocol UDP -LocalPort 48899 -Profile Domain,Private,Public; Write-Host 'Firewall rules configured successfully! You can close this window.'; Start-Sleep -Seconds 3\"".to_string()
+    };
 
     use windows::core::w;
     use windows::Win32::UI::Shell::ShellExecuteW;
@@ -182,10 +213,6 @@ fn launch_firewall_setup() {
 
     let op = w!("runas");
     let file = w!("powershell.exe");
-    let arg_str = format!(
-        "-NoProfile -ExecutionPolicy Bypass -File \"{}\"",
-        script_path.display()
-    );
     let params: Vec<u16> = arg_str.encode_utf16().chain(std::iter::once(0)).collect();
 
     unsafe {
@@ -209,7 +236,7 @@ mod tests {
     use std::collections::HashSet;
     use tray::{
         ID_ARRANGE_DISPLAYS, ID_AUTOSTART, ID_CONFIG_EDIT, ID_EXIT, ID_SETUP_FIREWALL,
-        ID_STATUS_HEADER, ID_SWITCH_EDGE, ID_UNLOCK,
+        ID_STATUS_HEADER, ID_SWITCH_EDGE, ID_UNLOCK, ID_VIEW_LOGS,
     };
 
     #[test]
@@ -223,6 +250,7 @@ mod tests {
             ID_EXIT,
             ID_ARRANGE_DISPLAYS,
             ID_SETUP_FIREWALL,
+            ID_VIEW_LOGS,
         ];
         let set: HashSet<_> = ids.iter().collect();
         assert_eq!(set.len(), ids.len(), "Tray menu IDs must be unique");

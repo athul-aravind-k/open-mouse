@@ -31,6 +31,7 @@ pub const ID_AUTOSTART: usize = 2005;
 pub const ID_EXIT: usize = 2006;
 pub const ID_ARRANGE_DISPLAYS: usize = 2007;
 pub const ID_SETUP_FIREWALL: usize = 2008;
+pub const ID_VIEW_LOGS: usize = 2009;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TrayEvent {
@@ -220,6 +221,10 @@ unsafe fn show_context_menu(hwnd: HWND) {
     let status_wide: Vec<u16> = status_str.encode_utf16().chain(std::iter::once(0)).collect();
     let _ = AppendMenuW(menu, MF_STRING | MF_DISABLED | MF_GRAYED, ID_STATUS_HEADER, PCWSTR(status_wide.as_ptr()));
 
+    let local_ip_str = format!("Local IP: {}\0", daemon::get_local_ip());
+    let local_ip_wide: Vec<u16> = local_ip_str.encode_utf16().collect();
+    let _ = AppendMenuW(menu, MF_STRING | MF_DISABLED | MF_GRAYED, 2010, PCWSTR(local_ip_wide.as_ptr()));
+
     let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
 
     let arrange_str = "Arrange Displays...\0".encode_utf16().collect::<Vec<_>>();
@@ -249,6 +254,9 @@ unsafe fn show_context_menu(hwnd: HWND) {
     let fw_str = "Configure Firewall...\0".encode_utf16().collect::<Vec<_>>();
     let _ = AppendMenuW(menu, MF_STRING, ID_SETUP_FIREWALL, PCWSTR(fw_str.as_ptr()));
 
+    let log_str = "View Logs...\0".encode_utf16().collect::<Vec<_>>();
+    let _ = AppendMenuW(menu, MF_STRING, ID_VIEW_LOGS, PCWSTR(log_str.as_ptr()));
+
     let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
 
     let exit_str = "Exit OpenMouse\0".encode_utf16().collect::<Vec<_>>();
@@ -270,7 +278,12 @@ unsafe fn show_context_menu(hwnd: HWND) {
 pub fn run_message_loop(running: Arc<AtomicBool>) {
     let mut msg = MSG::default();
     unsafe {
-        while running.load(Ordering::SeqCst) && GetMessageW(&mut msg, None, 0, 0).as_bool() {
+        while running.load(Ordering::SeqCst) {
+            let ret = GetMessageW(&mut msg, None, 0, 0);
+            if ret.0 <= 0 {
+                crate::append_log(&format!("GetMessageW returned {} (msg=0x{:X})", ret.0, msg.message));
+                break;
+            }
             let _ = TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }

@@ -51,7 +51,6 @@ impl DiscoveryService {
                 }
             };
 
-            let target_addr = format!("255.255.255.255:{}", DISCOVERY_PORT);
             let beacon = DiscoveryBeacon::new(id_bcast, name_bcast, local_tcp_port);
             let beacon_bytes = match beacon.to_bytes() {
                 Ok(b) => b,
@@ -63,9 +62,11 @@ impl DiscoveryService {
 
             while running_bcast.load(Ordering::SeqCst) {
                 if !connected_bcast.load(Ordering::SeqCst) {
-                    let _ = socket.send_to(&beacon_bytes, &target_addr);
+                    for target in get_broadcast_targets() {
+                        let _ = socket.send_to(&beacon_bytes, &target);
+                    }
                 }
-                thread::sleep(Duration::from_millis(2000));
+                thread::sleep(Duration::from_millis(1500));
             }
         });
 
@@ -153,20 +154,33 @@ impl DiscoveryService {
             }
         };
 
-        let target_addr = format!("255.255.255.255:{}", DISCOVERY_PORT);
         let beacon = DiscoveryBeacon::new(
             self.local_machine_id.clone(),
             self.local_device_name.clone(),
             self.local_tcp_port,
         );
         if let Ok(beacon_bytes) = beacon.to_bytes() {
-            let _ = socket.send_to(&beacon_bytes, &target_addr);
+            for target in get_broadcast_targets() {
+                let _ = socket.send_to(&beacon_bytes, &target);
+            }
         }
     }
 
     pub fn stop(&self) {
         self.running.store(false, Ordering::SeqCst);
     }
+}
+
+pub fn get_broadcast_targets() -> Vec<String> {
+    let mut targets = vec![format!("255.255.255.255:{}", DISCOVERY_PORT)];
+    let local_ip = crate::peer::get_local_ip();
+    if let Ok(std::net::IpAddr::V4(ipv4)) = local_ip.parse::<std::net::IpAddr>() {
+        let octets = ipv4.octets();
+        if octets[0] != 127 {
+            targets.push(format!("{}.{}.{}.255:{}", octets[0], octets[1], octets[2], DISCOVERY_PORT));
+        }
+    }
+    targets
 }
 
 impl Drop for DiscoveryService {
